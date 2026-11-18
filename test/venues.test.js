@@ -79,6 +79,8 @@ test('binance: buffered depth, trade side and book ticker', () => {
   send(c, { data: { e: 'depthUpdate', s: 'BTCUSDT', U: 11, u: 12, pu: 10, E: 111, b: [['100', '1']], a: [['101', '2']] } });
   send(c, { data: { e: 'trade', s: 'BTCUSDT', p: '100.5', q: '0.2', m: false, T: 112, t: 5 } });
   send(c, { data: { e: 'bookTicker', s: 'BTCUSDT', b: '100', B: '1', a: '101', A: '2', u: 12 } });
+  // bookTicker in the live combined stream has no "e" field
+  send(c, { stream: 'btcusdt@bookTicker', data: { u: 13, s: 'BTCUSDT', b: '100.1', B: '3', a: '101.1', A: '4' } });
 
   assert.equal(ev.update.length, 2);
   assert.equal(ev.update[0][1], 'bid');
@@ -88,8 +90,9 @@ test('binance: buffered depth, trade side and book ticker', () => {
   assert.equal(ev.trade[0][1], 'buy');
   assert.equal(ev.trade[0][2], 100.5);
   assert.equal(ev.trade[0][3], 0.2);
-  assert.equal(ev.ticker.length, 1);
+  assert.equal(ev.ticker.length, 2);
   assert.equal(ev.ticker[0][1].askPrice, 101);
+  assert.equal(ev.ticker[1][1].bidPrice, 100.1);
 });
 
 test('binance: sequence gap re-primes and drops updates', () => {
