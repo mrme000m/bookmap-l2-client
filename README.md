@@ -336,6 +336,10 @@ es.onmessage = (m) => {
 --rest-timeout ms        REST snapshot timeout (default 10000)
 --dom-sources s[,s]      also open DOM channels (e.g. ntv) for full-depth snapshots
 --dom-depth n            DOM depth limit (default 20)
+--history a,b            dxFeed symbols for Candle backfill (default = --symbols)
+--history-hours n        backfill depth in hours; default = the licence's max active
+                         Subscription.HistoricalDepthHours.* (e.g. LOCAL=180)
+--history-bar-ms ms      candle granularity (default 60000)
 --aggregation <sec>      event aggregation period (default 0.1)
 ```
 
@@ -365,6 +369,19 @@ plays it back through `lib/replay.js`:
 - `--replay-start` / `--replay-end` select a window; `--replay-loop` restarts it.
 - Credentials come from a git-ignored `.env` (`BOOKMAP_LICENSE_KEY=...`), loaded by
   server.js automatically.
+
+## History (dxFeed)
+
+In dxFeed mode the service also subscribes `Candle` events with a per-item
+`fromTime = now - hours`, where `hours` defaults to the max active
+`Subscription.HistoricalDepthHours.*` entitlement from the licence (the
+`.env` key's activation fields — e.g. `LOCAL=180`, exchange adapters 168/24).
+Historical candles warm up the TA indicators (`rsi`, `macd`, `adx`, `williamsR`
+have values from the first live metrics tick) and are exposed at
+`GET /history/<symbol>?limit=200` with `GET /history` as the status overview.
+
+Note: the anonymous demo endpoint serves the live candle only; the entitled
+depth comes with a real dxFeed token/endpoint via the licence activation.
 
 ## Notes
 

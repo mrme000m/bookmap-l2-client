@@ -300,6 +300,13 @@ Still open, unchanged by Path A:
 - **Record & Replay**: closed in wave 2 — see §12.
 - **Rithmic, BookmapData, CME/Nasdaq/EDGX**: no adapter or expired source entitlements;
   do not pursue until the source filters are renewed.
+- **Historical backfill (wave 3)**: the dxFeed path now requests `Candle` events with a
+  per-subscription `fromTime` derived from the licence's max active
+  `Subscription.HistoricalDepthHours.*` entitlement (`LOCAL=180` on the current key),
+  warms up the TA indicator bars and serves `GET /history`. Depth beyond the live
+  candle requires an entitled dxFeed token (the anonymous demo serves the live candle
+  only). Depth-history replay (L2 beyond recordings) remains exclusive to the
+  app's exchange adapters and BookmapData delivery.
 
 `/features` is now the authoritative in-code status: each feature carries
 `status` (`yes` / `derived` / `partial` / `no` / `not-entitled`) and a short `note`.

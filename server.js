@@ -21,6 +21,8 @@
 //   GET /correlation?a=<s>&b=<s>     cross-symbol return correlation
 //   GET /copy/<symbol>               same book across every tracking venue
 //   GET /liquidations                recent liquidations (?venue=&symbol=&limit=)
+//   GET /history                     candle backfill status per symbol
+//   GET /history/<symbol>            historical candles (?limit=200)
 //   GET /replay                      replay status (+ replay entitlements)
 //   POST /replay/ctrl                {action: pause|resume|stop|seek|speed|
 //                                     speed-up|speed-down|reset-speed|loop}
@@ -40,6 +42,7 @@ const symbolTable = require('./lib/symbolTable');
 const { capabilities } = require('./lib/capabilities');
 const { aggregate: aggregateBbo } = require('./lib/bbo');
 const { MPulseClient, toMpulseSymbol } = require('./lib/mpulse');
+const { HistoryService, entitlementHours } = require('./lib/history');
 
 // crypto venue -> Bookmap adapter name used for the entitlement check
 const VENUE_ADAPTERS = {
@@ -133,6 +136,9 @@ const cfg = {
   kickSeat: !!args['kick-seat'],
   bindSeat: !!args['bind-seat'],
   barMs: Number(args['bar-ms'] || 60000),
+  historySymbols: (args.history || '').split(',').map(s => s.trim()).filter(Boolean),
+  historyHours: args['history-hours'] != null ? Number(args['history-hours']) : null,
+  historyBarMs: Number(args['history-bar-ms'] || 60000),
   largeTradeSize: Number(args['large-trade-size'] || 0),
   mpulse: !!args.mpulse,
   mpulseAlgos: (args['mpulse-algos'] || 'priceChange,volumePressureImbalance/TP').split(',').map(s => s.trim()).filter(Boolean),
@@ -148,6 +154,8 @@ let authState = authRequired ? 'authenticating' : 'anonymous';
 let authInfo = null;
 const sseClients = new Set();
 let client = null;                    // DxLinkClient
+let historyService = null;            // HistoryService (dxFeed mode)
+let historyEntitlement = { max: 0, found: [] };
 const cryptoClients = new Map();      // venue -> adapter
 const venueStates = new Map();        // venue -> {state, lastFrameAt, detail}
 const books = new Map();              // venue -> {venue, book, metrics}
@@ -273,8 +281,15 @@ function wireVenueClient(venue, client) {
 }
 
 function wireDxLink() {
-  const { book } = ensureBook(DXFEED_BOOK);
+  const { book, metrics } = ensureBook(DXFEED_BOOK);
   client = new DxLinkClient({ url: cfg.url, token: cfg.token });
+  // historical backfill: Candle subscriptions with per-item fromTime warm up TA
+  const historySymbols = cfg.historySymbols.length ? cfg.historySymbols : cfg.symbols;
+  historyService = new HistoryService({
+    barMs: cfg.historyBarMs,
+    hours: cfg.historyHours != null ? cfg.historyHours : historyEntitlement.max,
+  });
+  const historyFrom = historyService.hours > 0 ? Date.now() - historyService.hours * 3600000 : null;
   client.on('log', onLog);
   client.on('authState', (s) => { authState = s; });
   client.on('error', (e) => console.error(`[feed-error] ${e.error}: ${e.message || ''} (channel=${e.channel})`));
@@ -286,6 +301,14 @@ function wireDxLink() {
         case 'Quote': book.applyQuote(ev); break;
         case 'Trade': book.applyTrade(ev); break;
         case 'MarketDepth': book.applyMarketDepth(ev); break;
+        case 'Candle': {
+          const c = historyService.onCandle(ev);
+          if (c && c.added && !c.live) {
+            // history candles older than the live window warm up the TA series
+            metrics.indicators.seedBars(c.symbol, [historyService.candlesFor(c.symbol, 1)[0]]);
+          }
+          break;
+        }
         default: book.emit('other', ev); break;
       }
     }
@@ -309,11 +332,20 @@ function wireDxLink() {
       Quote: ['eventType', 'eventSymbol', 'bidPrice', 'bidSize', 'askPrice', 'askSize'],
       Trade: ['eventType', 'eventSymbol', 'price', 'size', 'dayVolume'],
       MarketDepth: ['eventType', 'eventSymbol', 'bidAsk', 'market', 'price', 'size', 'eventFlags'],
+      Candle: ['eventType', 'eventSymbol', 'eventTime', 'time', 'sequence', 'count', 'open', 'high', 'low', 'close', 'volume', 'vwap'],
     },
   });
-  client.openFeedChannel(cfg.symbols.flatMap(s => cfg.events.map(t => ({ type: t, symbol: s }))));
+  client.openFeedChannel(cfg.symbols.flatMap(s => cfg.events.map(t => ({ type: t, symbol: s })))
+    .concat(historySymbols.flatMap(s => {
+      const item = { type: 'Candle', symbol: s };
+      if (historyFrom) item.fromTime = historyFrom;
+      return [item];
+    })));
   for (const symbol of cfg.symbols) {
     if (cfg.domSources.length) client.openDomChannel(symbol, cfg.domSources, { acceptAggregationPeriod: 0, acceptDepthLimit: cfg.domDepth });
+  }
+  if (historySymbols.length) {
+    console.error(`[history] candles for ${historySymbols.join(',')} depth=${historyService.hours}h granularity=${cfg.historyBarMs}ms fromTime=${historyFrom || 'live'}`);
   }
   client.start();
 }
@@ -657,6 +689,27 @@ if (cfg.http) {
         return json(res, ok ? 200 : 409, { ok, action, status: result });
       });
     }
+    if (p === '/history') {
+      if (!historyService) return json(res, 404, { error: 'history is only available in dxFeed mode' });
+      return json(res, 200, {
+        hours: historyService.hours,
+        barMs: historyService.barMs,
+        entitlement: historyEntitlement,
+        symbols: historyService.symbols().map(s => ({ symbol: s, candles: historyService.count(s) })),
+      });
+    }
+    if (p.startsWith('/history/')) {
+      if (!historyService) return json(res, 404, { error: 'history is only available in dxFeed mode' });
+      const symbol = decodeURIComponent(p.slice(9));
+      const limit = Math.min(Number(u.searchParams.get('limit') || 200), 5000);
+      const candles = historyService.candlesFor(symbol, limit);
+      if (!candles.length) return json(res, 404, { error: 'no candles for symbol', known: historyService.symbols() });
+      return json(res, 200, {
+        symbol, barMs: historyService.barMs, count: candles.length,
+        first: candles[0].start, last: candles[candles.length - 1].start,
+        candles,
+      });
+    }
     if (p === '/mpulse') {
       return json(res, 200, [...mpulseClients.entries()].map(([symbol, c]) => ({
         symbol, state: c.state || 'connecting', endpoints: c.endpointCount || 0,
@@ -698,7 +751,7 @@ if (cfg.http) {
         '/health', '/capabilities', '/symbols', '/symbols/catalog?q=<name>', '/venues', '/data', '/entitlements', '/features',
         '/book/<symbol>', '/book/<venue>/<symbol>', '/top/<symbol>',
         '/metrics', '/metrics/<symbol>', '/metrics/<venue>/<symbol>', '/bbo', '/liquidations', '/mpulse', '/stream',
-        '/replay', 'POST /replay/ctrl',
+        '/history', '/history/<symbol>', '/replay', 'POST /replay/ctrl',
         'POST /subscribe', 'POST /unsubscribe',
       ],
     });
@@ -836,6 +889,14 @@ async function start() {
     }
     console.error(`[bookmap-l2-client] mode=crypto venues=${cfg.venues.join(',')} symbols=${cfg.cryptoSymbols.join(',')} license=${authInfo ? authInfo.licenseKey : 'none'}`);
   } else {
+    historyEntitlement = entitlementHours(authInfo && authInfo.entitlements);
+    if (cfg.historyHours == null) cfg.historyHours = historyEntitlement.max;
+    if (historyEntitlement.found.length) {
+      console.error(`[history] entitlement: up to ${historyEntitlement.max}h (` +
+        historyEntitlement.found.map(f => `${f.key.replace('Subscription.HistoricalDepthHours.', '')}=${f.hours}`).join(', ') + ')');
+    } else {
+      console.error('[history] no Subscription.HistoricalDepthHours entitlements; live candles only');
+    }
     wireDxLink();
     console.error(`[bookmap-l2-client] mode=dxfeed url=${cfg.url} symbols=${cfg.symbols.join(',')} events=${cfg.events.join(',')} token=${cfg.token ? 'yes' : 'no'}`);
   }
