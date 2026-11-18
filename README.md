@@ -105,6 +105,89 @@ Symbol translation is per venue: `BTC-USD` becomes `BTC-USD` (Coinbase), `BTCUSD
 client, reconnect state, staleness watchdog and book. Books are addressed as
 `/book/<venue>/<symbol>` (explicit) or `/book/<symbol>` (first venue tracking it).
 
+## Subscribing to symbols
+
+Symbols can be set at startup (`--crypto-symbols`, `--symbols`) or added/removed at
+runtime over HTTP. Runtime changes apply to a single venue and are reflected in
+`GET /venues` and `GET /data` immediately.
+
+```bat
+:: start with one symbol
+server.js --crypto --venues coinbase --crypto-symbols BTC-USD --http 127.0.0.1:8200
+
+:: add symbols to a venue at runtime
+curl -X POST http://127.0.0.1:8200/subscribe ^
+  -H "Content-Type: application/json" ^
+  -d "{\"venue\":\"coinbase\",\"symbols\":[\"ETH-USD\",\"SOL-USD\"]}"
+
+:: remove a symbol
+curl -X POST http://127.0.0.1:8200/unsubscribe ^
+  -H "Content-Type: application/json" ^
+  -d "{\"venue\":\"coinbase\",\"symbols\":[\"SOL-USD\"]}"
+```
+
+Coinbase, Kraken, OKX, Bybit and Bitstamp apply the change incrementally on the open
+socket; Binance encodes streams in the URL, so it reconnects with the new stream set.
+Symbols are translated per venue (`BTC-USD` → `BTC-USD` / `BTCUSDT` / `XBT/USD` /
+`BTC-USDT` / `btcusd`).
+
+### Per-symbol data availability
+
+`GET /data` reports, per symbol and venue, which data kinds are present and their
+freshness:
+
+```json
+{ "venue": "coinbase", "symbol": "BTC-USD", "depthSource": "coinbase",
+  "kinds": ["depth", "quote", "trade"], "lastSeq": 0,
+  "updatesPerSec": 3579, "trades": 180,
+  "hasDepth": true, "hasTrades": true, "hasQuote": true }
+```
+
+`kinds` is `depth` (L2 book), `trade` (executed trades with side) and `quote`
+(top-of-book / ticker).
+
+## License entitlements
+
+`GET /entitlements` exposes the entitlement map returned by the Bookmap activation
+server, with each key resolved to `{active, expires, value}`:
+
+```
+Allow_Crypto, Allow_DxFeed, Allow_Rithmic, Allow_POC, Allow_LTracker,
+Allow_Replay, Allow_Trading, Allow_SyncCharts, Allow_DataExport, ...
+Subscription.DxFeed.Source.<VENUE>, Subscription.MaxInstruments.<X>,
+Crypto_Max_Instruments, ADAPTER.<venue>, *_Expiration_Date
+```
+
+Values are either a flag (`"1"`) or a GMT expiry (`"YYYY-MM-DD HH:MM:SS"`); a past
+date means the entitlement is not active.
+
+## Scope: this client vs. the Bookmap desktop app
+
+The Bookmap plan table (footprint, DOM Pro, execution pro, MBO bundle, time & sales,
+technical analysis, replay/recording, liquidity tracker, …) describes **features of the
+Bookmap desktop application**, not of this client. This client is a headless market-data
+service: it provides the **L2 substrate** those features are computed from, and does not
+implement the indicators, detectors, plugins, heat maps or replay engine themselves.
+
+What the client does provide per symbol and venue:
+
+| Data | Source | Notes |
+|---|---|---|
+| L2 order book | venue `level2`/`book`/`books`/`orderbook` channels | full depth for Coinbase, 100 levels for Kraken, 50 for OKX/Bybit |
+| Executed trades | `matches`/`trade`/`trades`/`live_trades`/`publicTrade` | price, size, side, timestamp |
+| Top of book | `ticker`/`bookTicker`/`tickers` | bid/ask price and size, last price |
+| Derived metrics | `lib/metrics.js` | spread, mid, microprice, imbalance, VWAP, trade flow, update rate |
+
+Indicators such as CVD, order-book imbalance, AVWAP, large-trade alerts, liquidity
+markers and market-pulse price change are **computable from this data** — the client
+already ships the primitives (per-level depth with sizes, trades with side, rolling VWAP
+and buy/sell flow). Features that need data the client does not receive are out of scope:
+MBO / order-level data (stops, icebergs, trader maps), DOM / footprint tick-by-tick,
+options gamma levels, historical replay and recording.
+
+License gating for the desktop features is visible through the activation server and is
+exposed by this client at `GET /entitlements`.
+
 ## Realtime metrics
 
 `MetricsEngine` derives per-symbol analytics from the book and trade stream: `spread`,
@@ -118,7 +201,10 @@ and can be streamed over SSE with `GET /stream?metrics=1` or appended to the `--
 | Endpoint | Description |
 |---|---|
 | `GET /health` | feed status: per-venue connection state/staleness, auth state, license, entitlements, tracked symbols |
-| `GET /symbols` | tracked symbols per venue (`{venue, symbol, depthSource, updatedAt}`) |
+| `GET /symbols` | tracked symbols per venue (`{venue, symbol, depthSource, updatedAt, kinds}`) |
+| `GET /venues` | per-venue native + canonical symbol sets and connection state |
+| `GET /data` | per-symbol data availability (`kinds`, `trades`, `updatesPerSec`, `lastSeq`) |
+| `GET /entitlements` | license entitlement map (`{active, expires, value}` per key) |
 | `GET /book/<symbol>` | full L2 snapshot: `bids[]` (desc), `asks[]` (asc), `top`, `quote`, `trade`, `lastSeq` |
 | `GET /book/<venue>/<symbol>` | full L2 snapshot of one venue |
 | `GET /top/<symbol>` | L1 top of book |
@@ -126,6 +212,8 @@ and can be streamed over SSE with `GET /stream?metrics=1` or appended to the `--
 | `GET /metrics/<symbol>` | computed metrics for one symbol |
 | `GET /metrics/<venue>/<symbol>` | computed metrics for one venue/symbol |
 | `GET /stream` | SSE deltas: `?symbol=` `?venue=` `?kinds=depth,trade,quote,snapshot` `?metrics=1` |
+| `POST /subscribe` | add symbols at runtime: `{"venue","symbols":[…]}` |
+| `POST /unsubscribe` | remove symbols at runtime: `{"venue","symbols":[…]}` |
 
 ### Example snapshot
 

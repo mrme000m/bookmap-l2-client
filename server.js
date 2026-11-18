@@ -153,6 +153,8 @@ function wireVenueClient(venue, client) {
     const st = venueStates.get(venue);
     if (st) st.lastFrameAt = Date.now();
   };
+  // ignore late frames for symbols that have been unsubscribed
+  const live = (symbol) => client.isSubscribed(symbol);
   client.on('log', onLog);
   client.on('state', (s, detail) => {
     const st = venueStates.get(venue) || {};
@@ -162,6 +164,7 @@ function wireVenueClient(venue, client) {
     venueStates.set(venue, st);
   });
   client.on('snapshot', (symbol, bids, asks, meta) => {
+    if (!live(symbol)) return;
     book.applyLevels({
       symbol, bids, asks, source: venue,
       seq: meta && meta.seq != null ? meta.seq : null,
@@ -170,10 +173,12 @@ function wireVenueClient(venue, client) {
     touch();
   });
   client.on('update', (symbol, side, price, size, meta) => {
+    if (!live(symbol)) return;
     book.applyLevel(symbol, side, price, size, venue, meta);
     touch();
   });
   client.on('trade', (symbol, side, price, size, ts, meta) => {
+    if (!live(symbol)) return;
     book.applyTrade({
       eventSymbol: symbol, price, size, time: ts,
       side, venue, seq: meta && meta.seq != null ? meta.seq : null,
@@ -181,6 +186,7 @@ function wireVenueClient(venue, client) {
     touch();
   });
   client.on('ticker', (symbol, t) => {
+    if (!live(symbol)) return;
     book.applyQuote({
       eventSymbol: symbol,
       bidPrice: t.bidPrice, bidSize: t.bidSize,
@@ -249,6 +255,22 @@ function json(res, code, obj) {
   res.end(body);
 }
 
+function readJsonBody(req, cb) {
+  let raw = '';
+  let done = false;
+  req.on('data', (c) => {
+    raw += c;
+    if (raw.length > 1e6 && !done) { done = true; cb(new Error('body too large')); req.destroy(); }
+  });
+  req.on('end', () => {
+    if (done) return;
+    done = true;
+    if (!raw.trim()) return cb(null, {});
+    try { cb(null, JSON.parse(raw)); } catch (e) { cb(e); }
+  });
+  req.on('error', (e) => { if (!done) { done = true; cb(e); } });
+}
+
 /** split "<venue>/<symbol>" or "<symbol>" */
 function splitPath(rest) {
   const parts = rest.split('/').filter(Boolean);
@@ -276,6 +298,44 @@ function allSymbols() {
     for (const s of entry.book.list()) out.push({ venue, ...s });
   }
   return out;
+}
+
+/**
+ * Runtime symbol subscription for crypto venues.
+ * @param {string} venue
+ * @param {string[]} canonicalSymbols canonical symbols, e.g. ["SOL-USD"]
+ * @param {boolean} remove
+ */
+function changeSubscription(venue, canonicalSymbols, remove) {
+  const client = cryptoClients.get(venue);
+  if (!client) {
+    return { ok: false, error: `unknown venue "${venue}"`, venues: [...cryptoClients.keys()] };
+  }
+  const def = VENUES[venue];
+  const native = [];
+  const canonical = [];
+  for (const sym of canonicalSymbols) {
+    const n = def.normalize(sym);
+    if (!n) continue;
+    native.push(n);
+    canonical.push(sym);
+  }
+  const changed = remove ? client.removeSymbols(native) : client.addSymbols(native);
+  const entry = books.get(venue);
+  for (let i = 0; i < canonical.length; i++) {
+    const sym = canonical[i];
+    const nat = native[i];
+    if (!remove) {
+      // make sure the symbol map knows the canonical name for the new native symbol
+      client.symbolMap[nat] = sym;
+      for (const alias of def.aliases(sym)) client.symbolMap[alias] = sym;
+    } else {
+      delete client.symbolMap[nat];
+      for (const alias of def.aliases(sym)) delete client.symbolMap[alias];
+      if (entry) entry.book.removeSymbol(sym);
+    }
+  }
+  return { ok: true, venue, action: remove ? 'unsubscribe' : 'subscribe', added: changed.length, symbols: canonical };
 }
 
 function bookJson(req, res, venue, symbol) {
@@ -344,6 +404,64 @@ if (cfg.http) {
     const p = u.pathname;
     if (p === '/health') return healthJson(res);
     if (p === '/symbols') return json(res, 200, allSymbols());
+    if (p === '/entitlements') {
+      return json(res, 200, {
+        licenseKey: authInfo ? authInfo.licenseKey : null,
+        authState,
+        entitlements: authInfo ? authInfo.entitlements : null,
+        maxInstruments: authInfo ? authInfo.maxInstruments : null,
+        crypto: authInfo ? authInfo.crypto : null,
+        dxfeed: authInfo && authInfo.dxfeed ? { filters: authInfo.dxfeed.filters, code: authInfo.dxfeed.code } : null,
+      });
+    }
+    if (p === '/venues') {      return json(res, 200, [...cryptoClients.keys()].map(v => ({
+        venue: v,
+        nativeSymbols: cryptoClients.get(v).symbols,
+        canonicalSymbols: Object.values(cryptoClients.get(v).symbolMap),
+        state: (venueStates.get(v) || {}).state || 'unknown',
+      })));
+    }
+    if (p === '/subscribe' && req.method === 'POST') {
+      return readJsonBody(req, (err, body) => {
+        if (err) return json(res, 400, { error: 'invalid JSON body' });
+        const venue = body.venue || cfg.venues[0];
+        const symbols = Array.isArray(body.symbols) ? body.symbols : [];
+        if (!symbols.length) return json(res, 400, { error: 'symbols[] required' });
+        if (!cfg.crypto) return json(res, 400, { error: 'runtime subscribe is only available in --crypto mode' });
+        const r = changeSubscription(venue, symbols, false);
+        return json(res, r.ok ? 200 : 404, r);
+      });
+    }
+    if (p === '/unsubscribe' && req.method === 'POST') {
+      return readJsonBody(req, (err, body) => {
+        if (err) return json(res, 400, { error: 'invalid JSON body' });
+        const venue = body.venue || cfg.venues[0];
+        const symbols = Array.isArray(body.symbols) ? body.symbols : [];
+        if (!symbols.length) return json(res, 400, { error: 'symbols[] required' });
+        if (!cfg.crypto) return json(res, 400, { error: 'runtime subscribe is only available in --crypto mode' });
+        const r = changeSubscription(venue, symbols, true);
+        return json(res, r.ok ? 200 : 404, r);
+      });
+    }
+    if (p === '/data') {
+      // per-symbol data availability across venues
+      return json(res, 200, allSymbols().map(s => {
+        const entry = books.get(s.venue);
+        const m = entry ? entry.metrics.compute(s.symbol) : null;
+        return {
+          venue: s.venue,
+          symbol: s.symbol,
+          depthSource: s.depthSource,
+          kinds: s.kinds,
+          lastSeq: m ? m.book.lastSeq : null,
+          updatesPerSec: m ? m.book.updatesPerSec : null,
+          trades: m ? m.trade.count : 0,
+          hasDepth: s.kinds.includes('depth'),
+          hasTrades: s.kinds.includes('trade'),
+          hasQuote: s.kinds.includes('quote'),
+        };
+      }));
+    }
     if (p === '/metrics') return metricsJson(req, res, null, null);
     if (p.startsWith('/metrics/')) {
       const { venue, symbol } = splitPath(p.slice(9));
@@ -381,8 +499,10 @@ if (cfg.http) {
     json(res, 404, {
       error: 'not found',
       endpoints: [
-        '/health', '/symbols', '/book/<symbol>', '/book/<venue>/<symbol>', '/top/<symbol>',
+        '/health', '/symbols', '/venues', '/data', '/entitlements',
+        '/book/<symbol>', '/book/<venue>/<symbol>', '/top/<symbol>',
         '/metrics', '/metrics/<symbol>', '/metrics/<venue>/<symbol>', '/stream',
+        'POST /subscribe', 'POST /unsubscribe',
       ],
     });
   });

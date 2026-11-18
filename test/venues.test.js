@@ -187,3 +187,66 @@ test('bitstamp: order book snapshot, diff and trade', () => {
   assert.equal(ev.trade[0][1], 'sell');
   assert.equal(ev.trade[0][2], 100.5);
 });
+
+test('runtime subscription: add and remove symbols per venue', () => {
+  const sent = [];
+  const c = new CoinbaseL2Client({ symbols: ['BTC-USD'] });
+  c.send = (m) => { sent.push(m); return true; };
+
+  const added = c.addSymbols(['ETH-USD', 'BTC-USD']);
+  assert.deepEqual(added, ['ETH-USD']);
+  assert.deepEqual(c.symbols, ['BTC-USD', 'ETH-USD']);
+  assert.equal(sent.length, 1);
+  assert.deepEqual(sent[0].product_ids, ['ETH-USD']);
+  assert.ok(sent[0].channels.includes('level2_batch'));
+
+  const removed = c.removeSymbols(['ETH-USD']);
+  assert.deepEqual(removed, ['ETH-USD']);
+  assert.deepEqual(c.symbols, ['BTC-USD']);
+  assert.equal(sent[1].type, 'unsubscribe');
+  assert.deepEqual(sent[1].product_ids, ['ETH-USD']);
+  // coinbase rejects "unsubscribe" without a channels list
+  assert.ok(Array.isArray(sent[1].channels) && sent[1].channels.includes('level2_batch'));
+
+  // removing an unknown symbol is a no-op
+  assert.deepEqual(c.removeSymbols(['NOPE-USD']), []);
+});
+
+test('runtime subscription: kraken/okx/bybit/bitstamp send incremental messages', () => {
+  const mk = (Cls, opts, check) => {
+    const sent = [];
+    const c = new Cls(opts);
+    c.send = (m) => { sent.push(m); return true; };
+    c.addSymbols(opts.add);
+    check(sent);
+  };
+
+  mk(KrakenL2Client, { symbols: ['XBT/USD'], add: ['ETH/USD'] }, (sent) => {
+    assert.equal(sent.length, 3);
+    assert.equal(sent[0].event, 'subscribe');
+    assert.deepEqual(sent[0].pair, ['ETH/USD']);
+  });
+  mk(OkxL2Client, { symbols: ['BTC-USDT'], add: ['ETH-USDT'] }, (sent) => {
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].op, 'subscribe');
+    assert.ok(sent[0].args.some(a => a.instId === 'ETH-USDT'));
+  });
+  mk(BybitL2Client, { symbols: ['BTCUSDT'], add: ['ETHUSDT'] }, (sent) => {
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].op, 'subscribe');
+    assert.ok(sent[0].args.includes('orderbook.50.ETHUSDT'));
+  });
+  mk(BitstampL2Client, { symbols: ['btcusd'], add: ['ethusd'] }, (sent) => {
+    assert.equal(sent.length, 3);
+    assert.equal(sent[0].event, 'bts:subscribe');
+    assert.equal(sent[0].data.channel, 'order_book_ethusd');
+  });
+});
+
+test('runtime subscription: binance rebuilds the stream URL', () => {
+  const c = new BinanceL2Client({ symbols: ['BTCUSDT'] });
+  assert.ok(c.url.includes('btcusdt@depth20@100ms'));
+  c.addSymbols(['ETHUSDT']);
+  assert.ok(c.url.includes('ethusdt@depth20@100ms'));
+  assert.ok(c.url.includes('btcusdt@depth20@100ms'));
+});
