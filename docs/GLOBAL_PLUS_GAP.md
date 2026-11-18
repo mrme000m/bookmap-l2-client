@@ -303,3 +303,21 @@ Still open, unchanged by Path A:
 
 `/features` is now the authoritative in-code status: each feature carries
 `status` (`yes` / `derived` / `partial` / `no` / `not-entitled`) and a short `note`.
+
+---
+
+## 11. Additional binary findings folded into the client (2026-11-18)
+
+- **dxFeed success code**: `DxFeedUtils$e.g.name()` in `dxfeed-adapter.jar` is the literal
+  string `"g"`; `getToken-v11.php` therefore signals success with `code:"g"`, not `"OK"`.
+  `lib/bookmapAuth.js` now recognises both, and `dxfeed.ok` drives the dxLink token wiring.
+- **Activation keep-alive**: `velox.activation.p` shows a dedicated `keep-alive` endpoint
+  next to `login`/`logout`/`tokenList/<GET|KICK>`. `BookmapAuth.keepAlive()` /
+  `--keep-alive-ms` uses it, but only when the seat is explicitly bound.
+- **Official symbol table**: the shipped client fetches
+  `https://bookmap.com/api/v1/symbols/symbols_v7.tsv`. `lib/symbolTable.js` parses and caches
+  it and exposes `GET /symbols/catalog?q=…` for canonical ↔ vendor symbol lookups
+  (`dxFeed`, `BookmapData`, Rithmic, CQG, IB, …).
+- Still deliberately not implemented: the BookmapData `SUBSCRIBE` delivery path (expired
+  source entitlements; non-browser fingerprinting) and activation-response signature
+  verification (the client relies on TLS instead).

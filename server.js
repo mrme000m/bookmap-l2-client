@@ -29,6 +29,7 @@ const { Sink } = require('./lib/sink');
 const { createVenue, VENUES } = require('./lib/venues');
 const { resolveWebSocket } = require('./lib/ws');
 const { featureSummary } = require('./lib/features');
+const symbolTable = require('./lib/symbolTable');
 const { aggregate: aggregateBbo } = require('./lib/bbo');
 const { MPulseClient, toMpulseSymbol } = require('./lib/mpulse');
 
@@ -98,6 +99,7 @@ const cfg = {
   largeTradeSize: Number(args['large-trade-size'] || 0),
   mpulse: !!args.mpulse,
   mpulseAlgos: (args['mpulse-algos'] || 'priceChange,volumePressureImbalance/TP').split(',').map(s => s.trim()).filter(Boolean),
+  keepAliveMs: Number(args['keep-alive-ms'] || 0),
 };
 
 if (!cfg.http && !cfg.stdio && !cfg.authOnly && !cfg.sinkFile) cfg.http = '127.0.0.1:8200';
@@ -422,6 +424,13 @@ if (cfg.http) {
     const u = new URL(req.url, 'http://localhost');
     const p = u.pathname;
     if (p === '/health') return healthJson(res);
+    if (p === '/symbols/catalog') {
+      const q = u.searchParams.get('q') || '';
+      const limit = Math.min(Number(u.searchParams.get('limit') || 25), 200);
+      return symbolTable.load()
+        .then(rows => json(res, 200, { source: symbolTable.SYMBOL_URL, count: rows.length, matches: symbolTable.find(rows, q, { limit }) }))
+        .catch(e => json(res, 502, { error: e.message }));
+    }
     if (p === '/symbols') return json(res, 200, allSymbols());
     if (p === '/entitlements') {
       return json(res, 200, {
@@ -542,7 +551,7 @@ if (cfg.http) {
     json(res, 404, {
       error: 'not found',
       endpoints: [
-        '/health', '/symbols', '/venues', '/data', '/entitlements', '/features',
+        '/health', '/symbols', '/symbols/catalog?q=<name>', '/venues', '/data', '/entitlements', '/features',
         '/book/<symbol>', '/book/<venue>/<symbol>', '/top/<symbol>',
         '/metrics', '/metrics/<symbol>', '/metrics/<venue>/<symbol>', '/bbo', '/mpulse', '/stream',
         'POST /subscribe', 'POST /unsubscribe',
@@ -577,7 +586,11 @@ async function start() {
       console.error(`[auth] OK license=${res.licenseKey} activation=${res.activation.result}` +
         (res.dxfeed ? ` dxfeed=${res.dxfeed.code} filters=${res.dxfeed.filters.join(',')}` : '') +
         (res.crypto ? ` cryptoAdapters=${res.crypto.adapters.length} maxInstruments=${res.crypto.maxInstruments}` : ''));
-      if (!cfg.crypto && res.dxfeed && res.dxfeed.code === 'OK' && res.dxfeed.token) cfg.token = res.dxfeed.token;
+      if (!cfg.crypto && res.dxfeed && (res.dxfeed.ok || res.dxfeed.code === 'OK') && res.dxfeed.token) cfg.token = res.dxfeed.token;
+      if (cfg.bindSeat && cfg.keepAliveMs > 0) {
+        authSession.startKeepAlive(cfg.keepAliveMs);
+        console.error(`[auth] seat keep-alive every ${cfg.keepAliveMs}ms`);
+      }
       if (cfg.crypto) {
         const adapters = res.crypto.adapters;
         const needed = [...new Set(cfg.venues.map(v => VENUE_ADAPTERS[v]).filter(Boolean))];

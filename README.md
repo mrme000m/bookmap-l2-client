@@ -24,7 +24,7 @@ Reconstructed from the shipped Bookmap client (`C:\Program Files\Bookmap\Bookmap
 |---|---|---|---|
 | email+password → license key | `https://scripts{1,2,3}.activation.bookmap.com/v1/inPlatformLogin/getKey.php` | form `login=<email>&password=<pw>` | `{"code":"OK","key":"XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX"}` |
 | license key → activation | `https://public{1,2,3}.activation.bookmap.com/ActivationAPI-v1/login` | form `json={"kick":…,"key":…,"login":true,"type":"DESKTOP","machineInfo":…}` | `{"result":"OK","token":…,"fields":{…entitlements…}}` |
-| license key → dxFeed token | `https://bookmap.com/api/v1/dxfeed/getToken-v11.php` | form `login=<licenseKey>&password=&filters=["nasdaq_rt",…]` | `{"code":"OK","token":"<base64url payload>.<sig>"}` |
+| license key → dxFeed token | `https://bookmap.com/api/v1/dxfeed/getToken-v11.php` | form `login=<licenseKey>&password=&filters=["nasdaq_rt",…]` | `{"code":"g","token":"..."}` (`"OK"` also accepted for legacy servers) |
 
 Notes from the reverse engineering:
 
@@ -40,6 +40,10 @@ Notes from the reverse engineering:
 - The activation response is signed: `Activations-Server-Signature-Value` +
   `Activations-Server-Signature-Timestamp` headers carry an RSA signature over
   `SHA-512(timestamp + ";" + body)`. This client trusts TLS and skips that check.
+- A bound seat has a dedicated `ActivationAPI-v1/keep-alive` endpoint; use `--keep-alive-ms`
+  (with `--bind-seat`) to keep it alive. The probe mode never binds or keeps a seat.
+- The shipped client downloads `https://bookmap.com/api/v1/symbols/symbols_v7.tsv` as its
+  vendor-symbol table; `GET /symbols/catalog?q=…` exposes the cached copy for lookups.
 - Live **crypto** L2 does not come from dxFeed — Bookmap connects straight to the exchange
   (Coinbase/Binance/…) and only uses the license to *gate* the adapter. dxFeed entitlements
   (`nasdaq_rt`, …) cover stocks & futures.
@@ -246,6 +250,7 @@ account or activation seat.
 |---|---|
 | `GET /health` | feed status: per-venue connection state/staleness, auth state, license, entitlements, tracked symbols |
 | `GET /symbols` | tracked symbols per venue (`{venue, symbol, depthSource, updatedAt, kinds}`) |
+| `GET /symbols/catalog?q=<name>&limit=<n>` | Bookmap's official `symbols_v7.tsv` vendor-symbol mapping (dxFeed, BookmapData, …) |
 | `GET /venues` | per-venue native + canonical symbol sets and connection state |
 | `GET /data` | per-symbol data availability (`kinds`, `trades`, `updatesPerSec`, `lastSeq`) |
 | `GET /entitlements` | license entitlement map (`{active, kind, expires, limit, value}` per key) |
@@ -302,6 +307,7 @@ es.onmessage = (m) => {
 --no-dxfeed-token        skip the getToken-v11.php call
 --bind-seat              bind the exclusive activation seat (login:true)
 --kick-seat              take over an existing activation session (kick:true)
+--keep-alive-ms ms       keep a bound seat alive (0 = off; only with --bind-seat)
 --crypto                 use the live crypto L2 feed
 --venues a,b,c           crypto venues (default coinbase): coinbase,binance,kraken,okx,bybit,bitstamp
 --crypto-symbols a,b     canonical symbols, e.g. BTC-USD,ETH-USD (translated per venue)
