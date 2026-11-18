@@ -321,3 +321,8 @@ Still open, unchanged by Path A:
 - Still deliberately not implemented: the BookmapData `SUBSCRIBE` delivery path (expired
   source entitlements; non-browser fingerprinting) and activation-response signature
   verification (the client relies on TLS instead).
+- REA artifact inventory of both JARs (11,487 + 4,887 entries) and extraction of the
+  locale/manifest resources produced no further capability manifests. Native REA
+  analysis (Ghidra/IDA/Kuna/Hopper) is not configured on this host, so no native
+  strings/functions were inspected. The recovered capability matrix is exposed at
+  `GET /capabilities` with its REA evidence ids.

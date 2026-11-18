@@ -253,6 +253,7 @@ account or activation seat.
 | `GET /symbols/catalog?q=<name>&limit=<n>` | Bookmap's official `symbols_v7.tsv` vendor-symbol mapping (dxFeed, BookmapData, …) |
 | `GET /venues` | per-venue native + canonical symbol sets and connection state |
 | `GET /data` | per-symbol data availability (`kinds`, `trades`, `updatesPerSec`, `lastSeq`) |
+| `GET /capabilities` | REA-backed adapter capability manifest, recovered endpoints, implemented feature list and evidence ids |
 | `GET /entitlements` | license entitlement map (`{active, kind, expires, limit, value}` per key) |
 | `GET /features` | entitlement resolution plus implementation `status`/`note` per feature and a `summary` |
 | `GET /bbo` | cross-venue best bid/offer, spread and mid per symbol |

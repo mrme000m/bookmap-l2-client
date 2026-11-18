@@ -30,6 +30,7 @@ const { createVenue, VENUES } = require('./lib/venues');
 const { resolveWebSocket } = require('./lib/ws');
 const { featureSummary } = require('./lib/features');
 const symbolTable = require('./lib/symbolTable');
+const { capabilities } = require('./lib/capabilities');
 const { aggregate: aggregateBbo } = require('./lib/bbo');
 const { MPulseClient, toMpulseSymbol } = require('./lib/mpulse');
 
@@ -442,6 +443,10 @@ if (cfg.http) {
         dxfeed: authInfo && authInfo.dxfeed ? { filters: authInfo.dxfeed.filters, code: authInfo.dxfeed.code } : null,
       });
     }
+    if (p === '/capabilities') {
+      const fields = authInfo && authInfo.activation ? authInfo.activation.fields : null;
+      return json(res, 200, capabilities(fields));
+    }
     if (p === '/features') {
       // which product features the licence entitles, resolved from the activation fields
       if (!authInfo) return json(res, 200, { authState, features: null, dataVenues: null });
@@ -551,7 +556,7 @@ if (cfg.http) {
     json(res, 404, {
       error: 'not found',
       endpoints: [
-        '/health', '/symbols', '/symbols/catalog?q=<name>', '/venues', '/data', '/entitlements', '/features',
+        '/health', '/capabilities', '/symbols', '/symbols/catalog?q=<name>', '/venues', '/data', '/entitlements', '/features',
         '/book/<symbol>', '/book/<venue>/<symbol>', '/top/<symbol>',
         '/metrics', '/metrics/<symbol>', '/metrics/<venue>/<symbol>', '/bbo', '/mpulse', '/stream',
         'POST /subscribe', 'POST /unsubscribe',
