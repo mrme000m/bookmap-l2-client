@@ -5,7 +5,7 @@
   "description": "Persistent realtime L2 market-data service: dxFeed dxLink plus multi-venue crypto",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
+    "start": "node --experimental-websocket server.js",
     "test": "node --test test/"
   },
   "engines": {

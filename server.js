@@ -21,6 +21,9 @@
 //   GET /correlation?a=<s>&b=<s>     cross-symbol return correlation
 //   GET /copy/<symbol>               same book across every tracking venue
 //   GET /liquidations                recent liquidations (?venue=&symbol=&limit=)
+//   GET /replay                      replay status (+ replay entitlements)
+//   POST /replay/ctrl                {action: pause|resume|stop|seek|speed|
+//                                     speed-up|speed-down|reset-speed|loop}
 
 const http = require('http');
 const { URL } = require('url');
@@ -29,7 +32,7 @@ const { BookEngine } = require('./lib/book');
 const { BookmapAuth } = require('./lib/bookmapAuth');
 const { MetricsEngine } = require('./lib/metrics');
 const { Sink } = require('./lib/sink');
-const { Replay } = require('./lib/replay');
+const { TimedReplay } = require('./lib/replay');
 const { createVenue, VENUES } = require('./lib/venues');
 const { resolveWebSocket } = require('./lib/ws');
 const { featureSummary } = require('./lib/features');
@@ -53,6 +56,20 @@ const VENUE_ADAPTERS = {
 const DXFEED_BOOK = 'dxfeed';
 
 // ---- CLI ----
+// zero-dep .env loader (before args so --flags win)
+const fs = require('fs');
+const path = require('path');
+const envFile = path.join(__dirname, '.env');
+if (fs.existsSync(envFile)) {
+  for (const line of fs.readFileSync(envFile, 'utf8').split(/\r?\n/)) {
+    const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
+    if (!m || line.trim().startsWith('#')) continue;
+    let v = m[2].trim();
+    if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+    if (!(m[1] in process.env)) process.env[m[1]] = v;
+  }
+}
+
 const args = {};
 for (let i = 2; i < process.argv.length; i++) {
   const a = process.argv[i];
@@ -79,6 +96,13 @@ for (const v of venues) {
 }
 if (args.venues && !cryptoMode) console.error('[warn] --venues only applies with --crypto; ignoring');
 
+// accept "1699999999999" (ms) or an ISO date string
+function parseTimeArg(v) {
+  if (/^\d+$/.test(String(v))) return Number(v);
+  const t = Date.parse(v);
+  return Number.isNaN(t) ? null : t;
+}
+
 const cfg = {
   url: args.url || 'wss://demo.dxfeed.com/market-data/dxlink-ws',
   token: args.token || process.env.DXFEED_TOKEN || '',
@@ -95,6 +119,11 @@ const cfg = {
   sinkFile: args.sink || null,
   sinkFormat: args['sink-format'] || null,
   replayFile: args.replay || null,
+  replaySpeed: args['replay-speed'] != null ? Number(args['replay-speed']) : null,
+  replayMaxSpeed: args['replay-max-speed'] != null ? Number(args['replay-max-speed']) : 8192,
+  replayLoop: !!args['replay-loop'],
+  replayStart: args['replay-start'] != null ? parseTimeArg(args['replay-start']) : null,
+  replayEnd: args['replay-end'] != null ? parseTimeArg(args['replay-end']) : null,
   sseHeartbeatMs: Number(args['sse-heartbeat'] || 15000),
   stalenessMs: Number(args['staleness-ms'] || 15000),
   restTimeoutMs: Number(args['rest-timeout'] || 10000),
@@ -586,6 +615,48 @@ if (cfg.http) {
       }
       return json(res, 200, out.slice(-limit).reverse());
     }
+    if (p === '/replay') {
+      const replay = cfg.replay;
+      if (!replay || !replay.status) return json(res, 404, { error: 'no replay running; start with --replay <file>' });
+      const ents = authInfo && authInfo.entitlements ? authInfo.entitlements : {};
+      return json(res, 200, {
+        ...replay.status(),
+        entitled: {
+          Allow_Replay: ents.Allow_Replay ? !!ents.Allow_Replay.active : null,
+          Allow_Recording: ents.Allow_Recording ? !!ents.Allow_Recording.active : null,
+          HistoricalDepthHours_LOCAL: ents['Subscription.HistoricalDepthHours.LOCAL']
+            ? ents['Subscription.HistoricalDepthHours.LOCAL'].value : null,
+        },
+      });
+    }
+    if (p === '/replay/ctrl' && req.method === 'POST') {
+      const replay = cfg.replay;
+      if (!replay || !replay.status) return json(res, 404, { error: 'no replay running; start with --replay <file>' });
+      return readJsonBody(req, async (err, body) => {
+        if (err) return json(res, 400, { error: 'invalid JSON body' });
+        const action = body && body.action;
+        let ok = false;
+        let result = null;
+        try {
+          switch (action) {
+            case 'pause': ok = replay.pause(); break;
+            case 'resume': ok = replay.resume(); break;
+            case 'stop': ok = replay.stop(); break;
+            case 'seek': ok = await replay.seek(body.ts); break;
+            case 'speed': ok = replay.setSpeed(body.speed); break;
+            case 'speed-up': ok = replay.speedUp(); break;
+            case 'speed-down': ok = replay.speedDown(); break;
+            case 'reset-speed': ok = replay.resetSpeed(); break;
+            case 'loop': ok = true; replay.loop = !!body.enabled; break;
+            default: return json(res, 400, { error: 'unknown action', actions: ['pause', 'resume', 'stop', 'seek', 'speed', 'speed-up', 'speed-down', 'reset-speed', 'loop'] });
+          }
+          result = replay.status();
+        } catch (e) {
+          return json(res, 500, { error: e.message });
+        }
+        return json(res, ok ? 200 : 409, { ok, action, status: result });
+      });
+    }
     if (p === '/mpulse') {
       return json(res, 200, [...mpulseClients.entries()].map(([symbol, c]) => ({
         symbol, state: c.state || 'connecting', endpoints: c.endpointCount || 0,
@@ -627,6 +698,7 @@ if (cfg.http) {
         '/health', '/capabilities', '/symbols', '/symbols/catalog?q=<name>', '/venues', '/data', '/entitlements', '/features',
         '/book/<symbol>', '/book/<venue>/<symbol>', '/top/<symbol>',
         '/metrics', '/metrics/<symbol>', '/metrics/<venue>/<symbol>', '/bbo', '/liquidations', '/mpulse', '/stream',
+        '/replay', 'POST /replay/ctrl',
         'POST /subscribe', 'POST /unsubscribe',
       ],
     });
@@ -690,18 +762,40 @@ async function start() {
 
   if (cfg.replayFile) {
     console.error(`[replay] ${cfg.replayFile}`);
-    const replay = new Replay((venue) => ensureBook(venue));
+    const replay = new TimedReplay((venue) => ensureBook(venue), {
+      speed: cfg.replaySpeed != null ? cfg.replaySpeed : 1,
+      maxSpeed: cfg.replayMaxSpeed,
+      loop: cfg.replayLoop,
+      startTs: cfg.replayStart,
+      endTs: cfg.replayEnd,
+      resetState: () => {
+        for (const entry of books.values()) {
+          for (const s of entry.book.symbols()) {
+            entry.book.removeSymbol(s);
+            entry.metrics.removeSymbol(s);
+          }
+        }
+      },
+    });
     cfg.replay = replay;
-    replay.play(cfg.replayFile, (evt) => {
+    const emitReplay = (evt) => {
       if (evt.kind === 'liquidation' && evt.venue) {
         const entry = ensureBook(evt.venue);
         entry.liquidations.push({ symbol: evt.symbol, ...(evt.data || {}), venue: evt.venue });
         if (entry.liquidations.length > 1000) entry.liquidations.shift();
       }
       broadcast(evt);
-    })
-      .then((r) => console.error(`[replay] done events=${r.events} errors=${r.errors}`))
-      .catch((e) => console.error(`[replay] failed: ${e.message}`));
+    };
+    // app parity: CurrentTimeUserMessage — time progression while the player runs
+    const ticker = setInterval(() => {
+      const st = replay.status();
+      if (st.done || !st.playing) return;
+      broadcast({ symbol: null, kind: 'replay-time', venue: null, ts: Date.now(), data: st });
+    }, 1000);
+    ticker.unref();
+    replay.start(cfg.replayFile, emitReplay)
+      .then(() => { clearInterval(ticker); console.error(`[replay] done events=${replay.events} errors=${replay.errors}`); })
+      .catch((e) => { clearInterval(ticker); console.error(`[replay] failed: ${e.message}`); });
     return;
   }
 

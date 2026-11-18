@@ -342,7 +342,7 @@ tested (41 tests, `node --test test/`):
 | Correlation Tracker | `lib/derived.js` `correlation()` + `GET /correlation?a=&b=&venue=` over rolling price returns |
 | Instrument Copy | `GET /copy/<symbol>` — one book per tracking venue |
 | Liquidation Indicator | `lib/venues/liquidations.js` — venue `binancef` (Binance USDT-M `!forceOrder@arr`) and venue `bybitlin` (Bybit v5 linear `allLiquidation`); events broadcast as `kind:"liquidation"` and buffered for `GET /liquidations` |
-| Recording / Record & Replay | `--sink` NDJSON recording + `lib/replay.js` `--replay <file>` rebuilds books and re-broadcasts signal/metrics/liquidation frames |
+| Recording / Record & Replay | `--sink` NDJSON recording + `lib/replay.js` `--replay <file>`: `TimedReplay` mirrors the desktop app's replay engine (speed steps x2/:2 clamped [0.125, 8192], pause = speed 0, seek with forward fast-forward and backward state-rebuild, loop, time windows); live controls via `GET /replay` + `POST /replay/ctrl` |
 
 New HTTP endpoints: `/correlation`, `/copy/<symbol>`, `/liquidations`.
 New venues: `binancef`, `bybitlin` (feed-only; no order book, relaxed staleness).
@@ -354,7 +354,19 @@ Scope notes:
 - Liquidation feeds are exchange-published fills (`forceOrder`, `allLiquidation`);
   Bookmap's *Liquidation Predictor* semantics are not reproduced.
 - Replay is client-side NDJSON of this service's own recorded stream, not Bookmap's
-  Java L1 replay module.
+  Java L1 replay module. Wave 3 aligned it with the app: REA inspection of the
+  installed `C:\Program Files\Bookmap` artifacts (`BookmapRecorder.jar`,
+  `bm-l1api.jar` `jx` reader, `Bookmap.jar` `providers.s` player / `velox.ib.E`) shows
+  the app's replay is a fast file reader into a time-ordered event tree plus a player
+  thread that owns virtual nanosecond time, ticks in 1 ms steps, treats pause as
+  speed 0, steps speed x2 (up) / :2 (down) clamped to [0.125, `max_replay_speed`
+  (default 8192)], and seeks by state-rebuild from the start. `TimedReplay`
+  (`lib/replay.js`) mirrors all of these, controlled live via `GET /replay` and
+  `POST /replay/ctrl`, and broadcasts `kind:"replay-time"` each second like the
+  app's `CurrentTimeUserMessage`. The app's recording format (`DataRecorder`: one-char
+  record tags `f/c/T/r/L/S/U/C/E/F`, nanosecond monotonic timestamps, `.bmf` feed +
+  `.bmo` orders files with a 1016-byte metadata sidecar) documents the semantics our
+  NDJSON sink covers with `kind`/`symbol`/`venue` fields.
 
 Remaining blockers are unchanged: MBO features (§6.1, Path B bridge), UI/execution
 features, and data venues without entitlements (BookmapData, CME/Nasdaq/EDGX,

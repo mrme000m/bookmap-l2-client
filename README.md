@@ -325,6 +325,12 @@ es.onmessage = (m) => {
 --mpulse-algos a,b       Market Pulse algos (default priceChange,volumePressureImbalance/TP)
 --sink <path>            append deltas/metrics to a file (.csv or .jsonl by extension)
 --sink-format jsonl|csv  override the sink format
+--replay <file>          replay a recorded NDJSON stream (from --sink) instead of a live feed
+--replay-speed x         initial replay speed (default 1 = real time; 0 starts paused)
+--replay-max-speed x     speed-up clamp (default 8192, matches the desktop app)
+--replay-loop            restart from the beginning when the recording ends
+--replay-start <ms|ISO>  only play events at or after this stream time
+--replay-end <ms|ISO>    only play events at or before this stream time
 --sse-heartbeat ms       SSE comment heartbeat (default 15000, 0 disables)
 --staleness-ms ms        force a reconnect after this much feed silence (default 15000)
 --rest-timeout ms        REST snapshot timeout (default 10000)
@@ -340,7 +346,25 @@ npm test
 ```
 
 Dependency-free `node:test` coverage for venue message parsing, symbol normalization,
-sequence-gap handling, book metadata and the metrics engine.
+sequence-gap handling, book metadata, the metrics engine and the replay engines.
+
+## Replay
+
+`--sink` records the full event stream as timestamped NDJSON (or CSV); `--replay <file>`
+plays it back through `lib/replay.js`:
+
+- `TimedReplay` mirrors the desktop app's replay (`BookTraderReplayL1`: `jx` reader +
+  `providers.s` player): paced playback on a virtual clock, pause = speed 0, x2 / :2
+  speed steps clamped to [0.125, 8192], and seek = instant re-application of events up
+  to the target (backward seeks rebuild state from scratch, like the app's rewind).
+- Live control: `GET /replay` (status + replay entitlements) and
+  `POST /replay/ctrl` with `{"action": "pause" | "resume" | "stop" | "seek" | "speed" |
+  "speed-up" | "speed-down" | "reset-speed" | "loop", "speed"?: x, "ts"?: ms}`.
+- While playing, the service broadcasts `kind:"replay-time"` status every second on
+  `/stream`, mirroring the app's `CurrentTimeUserMessage`.
+- `--replay-start` / `--replay-end` select a window; `--replay-loop` restarts it.
+- Credentials come from a git-ignored `.env` (`BOOKMAP_LICENSE_KEY=...`), loaded by
+  server.js automatically.
 
 ## Notes
 
