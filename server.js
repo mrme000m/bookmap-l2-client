@@ -89,6 +89,8 @@ const cfg = {
   authRequired,
   authOnly: !!args['auth-only'],
   noDxFeedToken: !!args['no-dxfeed-token'],
+  kickSeat: !!args['kick-seat'],
+  bindSeat: !!args['bind-seat'],
 };
 
 if (!cfg.http && !cfg.stdio && !cfg.authOnly && !cfg.sinkFile) cfg.http = '127.0.0.1:8200';
@@ -414,6 +416,22 @@ if (cfg.http) {
         dxfeed: authInfo && authInfo.dxfeed ? { filters: authInfo.dxfeed.filters, code: authInfo.dxfeed.code } : null,
       });
     }
+    if (p === '/features') {
+      // which product features the licence entitles, resolved from the activation fields
+      if (!authInfo) return json(res, 200, { authState, features: null, dataVenues: null });
+      const features = authInfo.features || [];
+      return json(res, 200, {
+        authState,
+        tier: authInfo.activation && authInfo.activation.fields
+          ? authInfo.activation.fields['Product.Type'] : null,
+        entitled: features.filter((f) => f.entitled).map((f) => ({ id: f.id, name: f.name })),
+        notEntitled: features.filter((f) => !f.entitled).map((f) => ({ id: f.id, name: f.name })),
+        features,
+        dataVenues: authInfo.dataVenues || [],
+        maxInstruments: authInfo.maxInstruments,
+        crypto: authInfo.crypto,
+      });
+    }
     if (p === '/venues') {      return json(res, 200, [...cryptoClients.keys()].map(v => ({
         venue: v,
         nativeSymbols: cryptoClients.get(v).symbols,
@@ -499,7 +517,7 @@ if (cfg.http) {
     json(res, 404, {
       error: 'not found',
       endpoints: [
-        '/health', '/symbols', '/venues', '/data', '/entitlements',
+        '/health', '/symbols', '/venues', '/data', '/entitlements', '/features',
         '/book/<symbol>', '/book/<venue>/<symbol>', '/top/<symbol>',
         '/metrics', '/metrics/<symbol>', '/metrics/<venue>/<symbol>', '/stream',
         'POST /subscribe', 'POST /unsubscribe',
@@ -521,7 +539,11 @@ async function start() {
   if (authRequired) {
     authSession = new BookmapAuth({
       email, password, licenseKey,
-      kick: true,
+      // The activation seat is exclusive and shared with the user's own
+      // Bookmap app: binding or kicking it would kill their live session.
+      // A read-only entitlement probe uses login:false and takes nothing.
+      kick: cfg.kickSeat,
+      login: cfg.bindSeat,
     });
     try {
       const res = await authSession.authenticate({ requestDxFeedToken: !cfg.noDxFeedToken && !cfg.crypto });

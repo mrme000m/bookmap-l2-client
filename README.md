@@ -149,17 +149,47 @@ freshness:
 ## License entitlements
 
 `GET /entitlements` exposes the entitlement map returned by the Bookmap activation
-server, with each key resolved to `{active, expires, value}`:
+server, with each key resolved to `{active, kind, expires, limit, value}`:
 
 ```
 Allow_Crypto, Allow_DxFeed, Allow_Rithmic, Allow_POC, Allow_LTracker,
 Allow_Replay, Allow_Trading, Allow_SyncCharts, Allow_DataExport, ...
 Subscription.DxFeed.Source.<VENUE>, Subscription.MaxInstruments.<X>,
-Crypto_Max_Instruments, ADAPTER.<venue>, *_Expiration_Date
+Crypto_Max_Instruments, ADAPTER.<venue>, STRATEGY.* (product features)
 ```
 
-Values are either a flag (`"1"`) or a GMT expiry (`"YYYY-MM-DD HH:MM:SS"`); a past
-date means the entitlement is not active.
+Entitlement values come in three shapes and are distinguished by `kind`:
+
+| kind | example | meaning |
+|---|---|---|
+| `flag` | `"1"` / `"0"` | enabled / disabled |
+| `limit` | `"20"`, `"168"`, `"1000000"` | a numeric allowance (instruments, history hours, sessions) |
+| `expiry` | `"2038-01-01 23:59:59"` | an expiry date; a past date means not entitled |
+
+`GET /features` resolves the product feature list (CVD, footprint, MBO bundle, DOM Pro,
+multibook, technical analysis, …) against those keys and reports which are entitled:
+
+```json
+{ "tier": "Global Plus Lifetime",
+  "entitled": [{ "id": "cvd", "name": "Cumulative Volume Delta (CVD)" }],
+  "notEntitled": [{ "id": "mbo-stops-icebergs", "name": "MBO: Stops & Icebergs Tracker" }],
+  "dataVenues": [{ "id": "bookmapdata", "entitled": true }],
+  "maxInstruments": 20 }
+```
+
+### Seat safety
+
+The activation **seat is exclusive** and shared with the user's own Bookmap app.
+`login:true` binds it and `kick:true` kills a live session elsewhere. Both are opt-in
+here:
+
+| flag | effect |
+|---|---|
+| (default) | `login:false, kick:false` — an entitlement probe that takes nothing |
+| `--bind-seat` | `login:true` — bind the activation seat (a real client session) |
+| `--kick-seat` | `kick:true` — take over an existing activation session |
+
+A probe never binds the seat, so `logout()` is a no-op and no live session is disturbed.
 
 ## Scope: this client vs. the Bookmap desktop app
 
@@ -204,7 +234,8 @@ and can be streamed over SSE with `GET /stream?metrics=1` or appended to the `--
 | `GET /symbols` | tracked symbols per venue (`{venue, symbol, depthSource, updatedAt, kinds}`) |
 | `GET /venues` | per-venue native + canonical symbol sets and connection state |
 | `GET /data` | per-symbol data availability (`kinds`, `trades`, `updatesPerSec`, `lastSeq`) |
-| `GET /entitlements` | license entitlement map (`{active, expires, value}` per key) |
+| `GET /entitlements` | license entitlement map (`{active, kind, expires, limit, value}` per key) |
+| `GET /features` | which product features the licence entitles, plus data venues |
 | `GET /book/<symbol>` | full L2 snapshot: `bids[]` (desc), `asks[]` (asc), `top`, `quote`, `trade`, `lastSeq` |
 | `GET /book/<venue>/<symbol>` | full L2 snapshot of one venue |
 | `GET /top/<symbol>` | L1 top of book |
@@ -253,6 +284,8 @@ es.onmessage = (m) => {
 --license-key <k>        Bookmap license key (or BOOKMAP_LICENSE_KEY)
 --auth-only              authenticate, print the result and exit
 --no-dxfeed-token        skip the getToken-v11.php call
+--bind-seat              bind the exclusive activation seat (login:true)
+--kick-seat              take over an existing activation session (kick:true)
 --crypto                 use the live crypto L2 feed
 --venues a,b,c           crypto venues (default coinbase): coinbase,binance,kraken,okx,bybit,bitstamp
 --crypto-symbols a,b     canonical symbols, e.g. BTC-USD,ETH-USD (translated per venue)
