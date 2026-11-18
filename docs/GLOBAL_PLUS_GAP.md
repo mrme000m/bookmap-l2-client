@@ -107,18 +107,18 @@ Legend: **YES** implemented · **DERIVED** substrate streamed, indicator absent 
 |---|---|---|---|
 | Cumulative Volume Delta (CVD) | yes | DERIVED | signed trades available; no cumulative series |
 | Large Trades Alert | yes | DERIVED | size+side present; no threshold/alerting |
-| Liquidity Marker | yes | DERIVED | depth sizes present; no marker output |
+| Liquidity Marker | yes | **YES** | `DepthSignals` depth-delta markers on the tape |
 | Order Book Imbalance | yes | **YES** | `imbalance.top5/top20` |
 | Volume Imbalance | yes | DERIVED | `buyVolume` vs `sellVolume` |
 | Footprint | yes | NO | needs per-bar trade aggregation at price |
-| Absorption Indicator | yes | NO | needs footprint + limit-order flow |
+| Absorption Indicator | yes | **YES** | trade-vs-depth replenishment heuristic (client-side) |
 | Sweep Indicator | yes | NO | needs MBO / order-level data |
 | Trade Impact | — | NO | not entitled |
 | Time & Sales | yes | **YES** | trade stream with price/size/side/time |
 | Market Pulse | yes | NO | server-side `beta.mpulse.bookmap.com`; fv00 calls it anonymously |
 | Market Pulse Price Change | yes | NO | same |
 | Strength Indicator | yes | NO | same |
-| Liquidation Indicator | yes | NO | needs an exchange liquidation feed |
+| Liquidation Indicator | yes | **YES** | `binancef` forceOrder + `bybitlin` allLiquidation markers |
 
 ### Book / price levels
 
@@ -128,11 +128,11 @@ Legend: **YES** implemented · **DERIVED** substrate streamed, indicator absent 
 | DOM Pro | yes | NO | desktop UI feature |
 | Midpoint | yes | **YES** | `mid` + `microprice` |
 | Cross BBO | yes | DERIVED | top of book per venue; aggregation not built |
-| Outside Liquidity | yes | DERIVED | depth beyond spread; no indicator |
+| Outside Liquidity | yes | **YES** | `outsideLiquidity` beyond top-N in `/metrics` |
 | Point of Control | yes | NO | needs volume-at-price profile |
 | Price Levels / Price Lines | — | NO | not entitled |
 | Multibook (Consolidated Book) | yes | **YES** | per-venue books, one engine each |
-| Instrument Copy | yes | DERIVED | same canonical symbol on several venues |
+| Instrument Copy | yes | **YES** | `GET /copy/<symbol>` across tracking venues |
 | Large Lot Tracker / Large Orders Filter | yes | DERIVED | depth levels by size |
 
 ### MBO bundle (order-level)
@@ -155,7 +155,7 @@ Legend: **YES** implemented · **DERIVED** substrate streamed, indicator absent 
 | Williams %R, RSI, MACD, ADX | yes | DERIVED | need OHLCV bars; no bar builder exposed |
 | OBV | yes | DERIVED | computable from trade flow |
 | Technical Analysis | yes | DERIVED | as above |
-| Correlation Tracker | yes | NO | needs multi-symbol series |
+| Correlation Tracker | yes | **YES** | `GET /correlation?a=&b=` over price returns |
 
 ### Charts, UI and execution
 
@@ -184,8 +184,8 @@ Legend: **YES** implemented · **DERIVED** substrate streamed, indicator absent 
 | dxFeed data | yes | **YES** | dxLink adapter; no entitled source filter here |
 | Rithmic data | yes | NO | no Rithmic adapter |
 | Data Export | yes | **YES** | `--sink` NDJSON/CSV, HTTP, SSE |
-| Recording | yes | PARTIAL | `--sink` appends deltas/metrics; no app-level recording |
-| Record & Replay | yes | NO | no replay engine |
+| Recording | yes | **YES** | `--sink` NDJSON/CSV feed + `--replay` |
+| Record & Replay | yes | **YES** | client-side `--replay <file>` rebuilds books and re-broadcasts |
 | BookmapData | yes | NO | not consumed; needs the licensed delivery gateway |
 | CME / Nasdaq / EDGX (BookmapData) | — | NO | not entitled |
 
@@ -297,7 +297,7 @@ Still open, unchanged by Path A:
 - **UI/execution features** (DOM Pro, columns, bottom panel, sync charts, brackets,
   execution statistics, trading journal, break-even, setups): out of scope for a
   headless data service.
-- **Record & Replay** and app-level recording: `--sink` remains a partial substitute.
+- **Record & Replay**: closed in wave 2 — see §12.
 - **Rithmic, BookmapData, CME/Nasdaq/EDGX**: no adapter or expired source entitlements;
   do not pursue until the source filters are renewed.
 
@@ -326,3 +326,36 @@ Still open, unchanged by Path A:
   analysis (Ghidra/IDA/Kuna/Hopper) is not configured on this host, so no native
   strings/functions were inspected. The recovered capability matrix is exposed at
   `GET /capabilities` with its REA evidence ids.
+
+---
+
+## 12. Wave 2 — code-closable gaps closed (2026-11-18)
+
+The remaining Group 1 items from the gap-closure plan are now implemented and unit
+tested (41 tests, `node --test test/`):
+
+| Feature | Implementation |
+|---|---|
+| Liquidity Marker | `lib/derived.js` `DepthSignals` — depth-delta markers emitted as `kind:"liquidity"` |
+| Absorption Indicator | `DepthSignals` — sell trade followed by bid replenishment ⇒ `kind:"absorption"` (heuristic; no order-level proof) |
+| Outside Liquidity | `lib/derived.js` `outsideLiquidity()` — depth beyond top-N, in `/metrics` |
+| Correlation Tracker | `lib/derived.js` `correlation()` + `GET /correlation?a=&b=&venue=` over rolling price returns |
+| Instrument Copy | `GET /copy/<symbol>` — one book per tracking venue |
+| Liquidation Indicator | `lib/venues/liquidations.js` — venue `binancef` (Binance USDT-M `!forceOrder@arr`) and venue `bybitlin` (Bybit v5 linear `allLiquidation`); events broadcast as `kind:"liquidation"` and buffered for `GET /liquidations` |
+| Recording / Record & Replay | `--sink` NDJSON recording + `lib/replay.js` `--replay <file>` rebuilds books and re-broadcasts signal/metrics/liquidation frames |
+
+New HTTP endpoints: `/correlation`, `/copy/<symbol>`, `/liquidations`.
+New venues: `binancef`, `bybitlin` (feed-only; no order book, relaxed staleness).
+`/features` status notes and the §5 matrix rows were updated accordingly.
+
+Scope notes:
+
+- Absorption is a heuristic over aggregated L2; real limit-order absorption needs MBO.
+- Liquidation feeds are exchange-published fills (`forceOrder`, `allLiquidation`);
+  Bookmap's *Liquidation Predictor* semantics are not reproduced.
+- Replay is client-side NDJSON of this service's own recorded stream, not Bookmap's
+  Java L1 replay module.
+
+Remaining blockers are unchanged: MBO features (§6.1, Path B bridge), UI/execution
+features, and data venues without entitlements (BookmapData, CME/Nasdaq/EDGX,
+Rithmic).

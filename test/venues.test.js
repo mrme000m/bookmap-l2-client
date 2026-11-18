@@ -33,7 +33,7 @@ test('registry: symbol normalization and factory', () => {
   assert.equal(c.venue, 'coinbase');
   assert.deepEqual(c.symbols, ['BTC-USD']);
   assert.equal(c.symbolMap['BTC-USD'], 'BTC-USD');
-  assert.deepEqual(Object.keys(VENUES).sort(), ['binance', 'bitstamp', 'bybit', 'coinbase', 'kraken', 'okx']);
+  assert.deepEqual(Object.keys(VENUES).sort(), ['binance', 'binancef', 'bitstamp', 'bybit', 'bybitlin', 'coinbase', 'kraken', 'okx']);
 });
 
 test('coinbase: snapshot, l2update and ticker', () => {

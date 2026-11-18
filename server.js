@@ -18,6 +18,9 @@
 //   GET /metrics/<symbol>            computed metrics for one symbol
 //   GET /stream                      SSE stream of book deltas
 //                                    (?symbol=&venue=&kinds=&metrics=1)
+//   GET /correlation?a=<s>&b=<s>     cross-symbol return correlation
+//   GET /copy/<symbol>               same book across every tracking venue
+//   GET /liquidations                recent liquidations (?venue=&symbol=&limit=)
 
 const http = require('http');
 const { URL } = require('url');
@@ -26,6 +29,7 @@ const { BookEngine } = require('./lib/book');
 const { BookmapAuth } = require('./lib/bookmapAuth');
 const { MetricsEngine } = require('./lib/metrics');
 const { Sink } = require('./lib/sink');
+const { Replay } = require('./lib/replay');
 const { createVenue, VENUES } = require('./lib/venues');
 const { resolveWebSocket } = require('./lib/ws');
 const { featureSummary } = require('./lib/features');
@@ -42,6 +46,8 @@ const VENUE_ADAPTERS = {
   okx: 'OKX',
   bybit: 'Bybit',
   bitstamp: 'Bitstamp',
+  binancef: 'Binance',
+  bybitlin: 'Bybit',
 };
 
 const DXFEED_BOOK = 'dxfeed';
@@ -88,6 +94,7 @@ const cfg = {
   metricsInterval: Number(args['metrics-interval'] || 1000),
   sinkFile: args.sink || null,
   sinkFormat: args['sink-format'] || null,
+  replayFile: args.replay || null,
   sseHeartbeatMs: Number(args['sse-heartbeat'] || 15000),
   stalenessMs: Number(args['staleness-ms'] || 15000),
   restTimeoutMs: Number(args['rest-timeout'] || 10000),
@@ -104,6 +111,7 @@ const cfg = {
 };
 
 if (!cfg.http && !cfg.stdio && !cfg.authOnly && !cfg.sinkFile) cfg.http = '127.0.0.1:8200';
+if (cfg.replayFile && !cfg.http) cfg.http = '127.0.0.1:8200';
 
 // ---- engine ----
 const startedAt = new Date().toISOString();
@@ -140,11 +148,19 @@ function ensureBook(venue) {
     book, intervalMs: cfg.metricsInterval,
     barMs: cfg.barMs, largeTradeSize: cfg.largeTradeSize,
   });
-  entry = { venue, book, metrics };
+  entry = { venue, book, metrics, liquidations: [] };
   books.set(venue, entry);
 
-  book.on('delta', (d) => broadcast({ ...d, venue }));
+  book.on('delta', (d) => {
+    const evt = { ...d, venue };
+    if (d.kind === 'snapshot') {
+      const levels = book.currentLevels(d.symbol);
+      if (levels) evt.levels = levels;
+    }
+    broadcast(evt);
+  });
   book.on('gap', (g) => broadcast({ symbol: g.symbol, kind: 'gap', data: g.detail, ts: g.ts, venue }));
+  metrics.on('signal', (s) => broadcast({ symbol: s.symbol, kind: s.kind, data: s, ts: s.ts || Date.now(), venue }));
   metrics.on('metrics', (m) => {
     const evt = { symbol: m.symbol, kind: 'metrics', data: m, ts: Date.now(), venue };
     if (cfg.stdio) process.stdout.write(JSON.stringify(evt) + '\n');
@@ -211,6 +227,13 @@ function wireVenueClient(venue, client) {
       askPrice: t.askPrice, askSize: t.askSize,
       eventTime: t.time,
     });
+  });
+  client.on('liquidation', (symbol, liq, meta) => {
+    const entry = ensureBook(venue);
+    entry.liquidations.push({ symbol, ...liq, venue });
+    if (entry.liquidations.length > 1000) entry.liquidations.shift();
+    broadcast({ symbol, kind: 'liquidation', data: liq, ts: (meta && meta.ts) || Date.now(), venue });
+    touch();
   });
   client.on('gap', (symbol, detail) => {
     book.emit('gap', { symbol, venue, detail, ts: Date.now() });
@@ -518,6 +541,51 @@ if (cfg.http) {
       return metricsJson(req, res, venue, symbol);
     }
     if (p === '/bbo') return json(res, 200, aggregateBbo(books));
+    if (p === '/correlation') {
+      const a = u.searchParams.get('a');
+      const b = u.searchParams.get('b');
+      const venue = u.searchParams.get('venue');
+      const entries = venue ? (books.has(venue) ? [[venue, books.get(venue)]] : []) : [...books.entries()];
+      const out = [];
+      for (const [v, entry] of entries) {
+        const symbols = entry.book.list().map(s => s.symbol);
+        if (a && b) {
+          if (!symbols.includes(a) || !symbols.includes(b)) continue;
+          const c = entry.metrics.correlation(a, b);
+          if (c != null) out.push({ venue: v, a, b, correlation: c });
+        } else if (a) {
+          for (const s of symbols) {
+            if (s === a) continue;
+            const c = entry.metrics.correlation(a, s);
+            if (c != null) out.push({ venue: v, a, b: s, correlation: c });
+          }
+        }
+      }
+      return json(res, 200, out);
+    }
+    if (p.startsWith('/copy/')) {
+      const symbol = decodeURIComponent(p.slice(6));
+      const out = [];
+      for (const [v, entry] of books) {
+        const snap = entry.book.snapshot(symbol);
+        if (snap) out.push({ venue: v, ...snap });
+      }
+      return json(res, out.length ? 200 : 404, out.length ? out : { error: 'unknown symbol', tracked: allSymbols() });
+    }
+    if (p === '/liquidations') {
+      const venue = u.searchParams.get('venue');
+      const symbol = u.searchParams.get('symbol');
+      const limit = Math.min(Number(u.searchParams.get('limit') || 100), 1000);
+      const entries = venue ? (books.has(venue) ? [[venue, books.get(venue)]] : []) : [...books.entries()];
+      const out = [];
+      for (const [v, entry] of entries) {
+        for (const l of entry.liquidations) {
+          if (symbol && l.symbol !== symbol) continue;
+          out.push(l);
+        }
+      }
+      return json(res, 200, out.slice(-limit).reverse());
+    }
     if (p === '/mpulse') {
       return json(res, 200, [...mpulseClients.entries()].map(([symbol, c]) => ({
         symbol, state: c.state || 'connecting', endpoints: c.endpointCount || 0,
@@ -558,7 +626,7 @@ if (cfg.http) {
       endpoints: [
         '/health', '/capabilities', '/symbols', '/symbols/catalog?q=<name>', '/venues', '/data', '/entitlements', '/features',
         '/book/<symbol>', '/book/<venue>/<symbol>', '/top/<symbol>',
-        '/metrics', '/metrics/<symbol>', '/metrics/<venue>/<symbol>', '/bbo', '/mpulse', '/stream',
+        '/metrics', '/metrics/<symbol>', '/metrics/<venue>/<symbol>', '/bbo', '/liquidations', '/mpulse', '/stream',
         'POST /subscribe', 'POST /unsubscribe',
       ],
     });
@@ -618,6 +686,23 @@ async function start() {
     console.error('[auth-only] authentication verified; not starting feed');
     await authSession.logout().catch(() => {});
     process.exit(0);
+  }
+
+  if (cfg.replayFile) {
+    console.error(`[replay] ${cfg.replayFile}`);
+    const replay = new Replay((venue) => ensureBook(venue));
+    cfg.replay = replay;
+    replay.play(cfg.replayFile, (evt) => {
+      if (evt.kind === 'liquidation' && evt.venue) {
+        const entry = ensureBook(evt.venue);
+        entry.liquidations.push({ symbol: evt.symbol, ...(evt.data || {}), venue: evt.venue });
+        if (entry.liquidations.length > 1000) entry.liquidations.shift();
+      }
+      broadcast(evt);
+    })
+      .then((r) => console.error(`[replay] done events=${r.events} errors=${r.errors}`))
+      .catch((e) => console.error(`[replay] failed: ${e.message}`));
+    return;
   }
 
   try {
