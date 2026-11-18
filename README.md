@@ -5,13 +5,15 @@ programmatic consumption.
 
 Two data paths:
 
-- **Live crypto L2** over the Coinbase Exchange `level2_batch` WebSocket feed, gated by
-  emulated Bookmap app-level authentication (email + password, or license key).
+- **Live crypto L2** from several public exchange WebSocket feeds, gated by emulated
+  Bookmap app-level authentication (email + password, or license key):
+  Coinbase, Binance, Kraken, OKX, Bybit and Bitstamp.
 - **dxFeed dxLink** (`MarketDepth`/`DOM` for full L2, `Quote` fallback) for stocks & futures.
 
 ## Requirements
 
-- Node.js >= 22 (global `WebSocket`). Uses **no npm dependencies**.
+- Node.js >= 22 (global `WebSocket`). On Node 20 run with `node --experimental-websocket server.js`.
+  Uses **no npm dependencies** (an optional `ws` or `undici` install is picked up if present).
 
 ## Bookmap app-level authentication (emulated)
 
@@ -58,6 +60,12 @@ set BOOKMAP_PASSWORD=your-password
 set BOOKMAP_LICENSE_KEY=XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX
 "C:\path\to\node.exe" server.js --crypto --crypto-symbols BTC-USD --http 127.0.0.1:8200
 
+:: several crypto venues at once, with metrics + JSONL sink
+"C:\path\to\node.exe" server.js --crypto --venues coinbase,binance,kraken --crypto-symbols BTC-USD --metrics-interval 1000 --sink deltas.jsonl
+
+:: same feed as CSV for a single venue
+"C:\path\to\node.exe" server.js --crypto --venues bitstamp --crypto-symbols BTC-USD --sink deltas.csv
+
 :: NDJSON deltas on stdout (no HTTP)
 "C:\path\to\node.exe" server.js --crypto --crypto-symbols BTC-USD --stdio
 
@@ -71,18 +79,53 @@ set BOOKMAP_LICENSE_KEY=XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX
 "C:\path\to\node.exe" server.js --url wss://<your-endpoint> --symbols ESZ26 --events MarketDepth,Quote,Trade --http 127.0.0.1:8200
 ```
 
-If no credentials are supplied the service still runs (anonymous), but the crypto mode requires
-a successful authentication first.
+The crypto feeds are public, so the service also runs anonymously. Credentials only add the
+Bookmap entitlement check (`--venues` adapter names and instrument count) and are not required
+to receive market data.
+
+## Crypto venues
+
+Each venue adapter normalizes its native feed into one event stream (`snapshot`, `depth`
+updates, `trade`, `ticker`) and into one book keyed by the canonical symbol you pass in
+(e.g. `BTC-USD`). Each venue keeps its **own** book, so books are never mixed across venues.
+
+| Venue | L2 channel | Extra channels | Sequence gap repair |
+|---|---|---|---|
+| Coinbase | `level2_batch` | `ticker`, `matches`, `heartbeat` | REST `/products/<id>/book?level=2` |
+| Binance | `<sym>@depth20@100ms` | `@trade`, `@bookTicker` | REST `/api/v3/depth` + buffered replay |
+| Kraken | `book-100` | `trade`, `ticker` | reconnect |
+| OKX | `books` | `trades`, `tickers` | resubscribe on `prevSeqId` break |
+| Bybit | `orderbook.50` | `publicTrade`, `tickers` | reconnect |
+| Bitstamp | `order_book` + `diff_order_book` | `live_trades` | reconnect |
+
+Symbol translation is per venue: `BTC-USD` becomes `BTC-USD` (Coinbase), `BTCUSDT`
+(Binance/Bybit), `XBT/USD` (Kraken), `BTC-USDT` (OKX) and `btcusd` (Bitstamp).
+
+`--venues coinbase,binance` subscribes to several venues at once; each venue gets its own
+client, reconnect state, staleness watchdog and book. Books are addressed as
+`/book/<venue>/<symbol>` (explicit) or `/book/<symbol>` (first venue tracking it).
+
+## Realtime metrics
+
+`MetricsEngine` derives per-symbol analytics from the book and trade stream: `spread`,
+`spreadBps`, `mid`, `microprice`, top-5/top-20 `imbalance`, depth totals, rolling `vwap` /
+buy vs sell volume over a 60 s window, trade count and book `updatesPerSec`. Metrics are
+available at `GET /metrics` and `GET /metrics/<symbol>` (or `/metrics/<venue>/<symbol>`),
+and can be streamed over SSE with `GET /stream?metrics=1` or appended to the `--sink` file.
 
 ## HTTP API
 
 | Endpoint | Description |
 |---|---|
-| `GET /health` | feed status: connection state, auth state, license, entitlements, tracked symbols |
-| `GET /symbols` | tracked symbols + depth source (`coinbase` / `dom` / `marketdepth` / `quote`) |
-| `GET /book/<symbol>` | full L2 snapshot: `bids[]` (desc), `asks[]` (asc), `top`, `quote`, `trade` |
+| `GET /health` | feed status: per-venue connection state/staleness, auth state, license, entitlements, tracked symbols |
+| `GET /symbols` | tracked symbols per venue (`{venue, symbol, depthSource, updatedAt}`) |
+| `GET /book/<symbol>` | full L2 snapshot: `bids[]` (desc), `asks[]` (asc), `top`, `quote`, `trade`, `lastSeq` |
+| `GET /book/<venue>/<symbol>` | full L2 snapshot of one venue |
 | `GET /top/<symbol>` | L1 top of book |
-| `GET /stream` | SSE stream of all book deltas (`?symbol=AAPL` to filter) |
+| `GET /metrics` | computed metrics for all tracked symbols |
+| `GET /metrics/<symbol>` | computed metrics for one symbol |
+| `GET /metrics/<venue>/<symbol>` | computed metrics for one venue/symbol |
+| `GET /stream` | SSE deltas: `?symbol=` `?venue=` `?kinds=depth,trade,quote,snapshot` `?metrics=1` |
 
 ### Example snapshot
 
@@ -102,14 +145,14 @@ a successful authentication first.
 ```js
 const base = 'http://127.0.0.1:8200';
 
-// poll snapshots
-const book = await (await fetch(`${base}/book/BTC-USD`)).json();
+// poll snapshots (per venue: /book/<venue>/<symbol>)
+const book = await (await fetch(`${base}/book/coinbase/BTC-USD`)).json();
 console.log(book.top, book.bids[0], book.asks[0]);
 
 // stream deltas
-const es = new EventSource(`${base}/stream`);
+const es = new EventSource(`${base}/stream?venue=coinbase&metrics=1`);
 es.onmessage = (m) => {
-  const d = JSON.parse(m.data); // {symbol, kind: 'depth'|'quote'|'trade'|'snapshot', data, ts}
+  const d = JSON.parse(m.data); // {symbol, kind: 'depth'|'quote'|'trade'|'snapshot'|'metrics', data, ts, venue}
   if (d.kind === 'depth') console.log(d.symbol, d.data.side, d.data.price, d.data.size);
 };
 ```
@@ -122,24 +165,42 @@ es.onmessage = (m) => {
 --license-key <k>        Bookmap license key (or BOOKMAP_LICENSE_KEY)
 --auth-only              authenticate, print the result and exit
 --no-dxfeed-token        skip the getToken-v11.php call
---crypto                 use the live crypto (Coinbase) L2 feed
---crypto-symbols a,b     crypto products, e.g. BTC-USD,ETH-USD
+--crypto                 use the live crypto L2 feed
+--venues a,b,c           crypto venues (default coinbase): coinbase,binance,kraken,okx,bybit,bitstamp
+--crypto-symbols a,b     canonical symbols, e.g. BTC-USD,ETH-USD (translated per venue)
 --url <wss>              dxLink endpoint (default demo)
 --token <t>              dxFeed auth token (or DXFEED_TOKEN)
 --symbols a,b,c          dxFeed subscriptions (dxFeed symbol syntax, e.g. ESZ26, AAPL)
 --events a,b,c           Quote, Trade, MarketDepth
 --http host:port         enable HTTP API (default 127.0.0.1:8200)
 --stdio                  print NDJSON deltas to stdout
+--metrics-interval ms    metrics emit interval (default 1000)
+--sink <path>            append deltas/metrics to a file (.csv or .jsonl by extension)
+--sink-format jsonl|csv  override the sink format
+--sse-heartbeat ms       SSE comment heartbeat (default 15000, 0 disables)
+--staleness-ms ms        force a reconnect after this much feed silence (default 15000)
+--rest-timeout ms        REST snapshot timeout (default 10000)
 --dom-sources s[,s]      also open DOM channels (e.g. ntv) for full-depth snapshots
 --dom-depth n            DOM depth limit (default 20)
 --aggregation <sec>      event aggregation period (default 0.1)
 ```
 
+## Tests
+
+```
+npm test
+```
+
+Dependency-free `node:test` coverage for venue message parsing, symbol normalization,
+sequence-gap handling, book metadata and the metrics engine.
+
 ## Notes
 
 - Symbols use dxFeed syntax (`ESZ26` = ES Dec-2026 future, `AAPL` = stock) for the dxFeed path;
-  the crypto path uses exchange product ids (`BTC-USD`, `ETH-USD`).
+  the crypto path takes canonical symbols (`BTC-USD`, `ETH-USD`) and translates them per venue.
 - Demo data is delayed and depth-limited by dxFeed; the code path is identical for production tokens.
-- This client speaks the public, documented protocols (dxFeed dxLink, Coinbase Exchange
-  websocket) plus the Bookmap activation/token endpoints required to authenticate. You must have
-  rights to whatever market data you subscribe to.
+- Venue adapters normalize to the same event names and book model, so switching venues (or
+  running several at once) does not change the HTTP/SSE/sink contract.
+- This client speaks public, documented protocols (dxFeed dxLink, Coinbase, Binance, Kraken, OKX,
+  Bybit and Bitstamp websockets) plus the Bookmap activation/token endpoints required to
+  authenticate. You must have rights to whatever market data you subscribe to.

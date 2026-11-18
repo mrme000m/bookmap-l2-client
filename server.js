@@ -1,30 +1,45 @@
 #!/usr/bin/env node
 'use strict';
-// Bookmap-style persistent L2 market-data service over dxFeed dxLink, or live
-// crypto L2 over the Coinbase Exchange feed, gated by emulated Bookmap
-// app-level authentication.
+// Bookmap-style persistent L2 market-data service.
+//   - dxFeed dxLink (stocks/futures), or
+//   - live crypto L2 from several venues (Coinbase, Binance, Kraken, OKX, Bybit,
+//     Bitstamp), gated by emulated Bookmap app-level authentication.
 //
-// Auth (emulated from the shipped Bookmap client):
-//   email + password -> scripts*.activation.bookmap.com /v1/inPlatformLogin/getKey.php
-//   license key      -> public*.activation.bookmap.com/ActivationAPI-v1/login
-//   license key      -> bookmap.com/api/v1/dxfeed/getToken-v11.php (dxFeed token)
+// Every venue owns its own book and metrics engine, so books are never mixed.
+// Books are addressed as "<symbol>" (first venue that tracks it) or "<venue>/<symbol>".
 //
 // HTTP API:
-//   GET /health            service/feed/auth status
-//   GET /symbols           tracked symbols
-//   GET /book/<symbol>     full L2 snapshot JSON
-//   GET /top/<symbol>      L1 top of book
-//   GET /stream            SSE stream of book deltas (?symbol= filter)
+//   GET /health                      service/feed/auth status
+//   GET /symbols                     tracked symbols per venue
+//   GET /book/<symbol>               full L2 snapshot JSON
+//   GET /book/<venue>/<symbol>       full L2 snapshot of one venue
+//   GET /top/<symbol>                L1 top of book
+//   GET /metrics                     computed metrics for all tracked symbols
+//   GET /metrics/<symbol>            computed metrics for one symbol
+//   GET /stream                      SSE stream of book deltas
+//                                    (?symbol=&venue=&kinds=&metrics=1)
 
 const http = require('http');
 const { URL } = require('url');
 const { DxLinkClient } = require('./lib/dxlink');
-const { CoinbaseL2Client } = require('./lib/coinbase');
 const { BookEngine } = require('./lib/book');
 const { BookmapAuth } = require('./lib/bookmapAuth');
+const { MetricsEngine } = require('./lib/metrics');
+const { Sink } = require('./lib/sink');
+const { createVenue, VENUES } = require('./lib/venues');
+const { resolveWebSocket } = require('./lib/ws');
 
-// crypto venue -> Bookmap adapter name (entitlement check)
-const CRYPTO_ADAPTERS = { 'BTC-USD': 'CoinbasePro', 'ETH-USD': 'CoinbasePro' };
+// crypto venue -> Bookmap adapter name used for the entitlement check
+const VENUE_ADAPTERS = {
+  coinbase: 'CoinbasePro',
+  binance: 'Binance',
+  kraken: 'Kraken',
+  okx: 'OKX',
+  bybit: 'Bybit',
+  bitstamp: 'Bitstamp',
+};
+
+const DXFEED_BOOK = 'dxfeed';
 
 // ---- CLI ----
 const args = {};
@@ -44,6 +59,15 @@ const licenseKey = args['license-key'] || process.env.BOOKMAP_LICENSE_KEY || '';
 const cryptoMode = !!args.crypto;
 const authRequired = !!(email || password || licenseKey);
 
+const venues = (args.venues || 'coinbase').split(',').map(s => s.trim()).filter(Boolean);
+for (const v of venues) {
+  if (!VENUES[v]) {
+    console.error(`[fatal] unknown venue "${v}"; known: ${Object.keys(VENUES).join(', ')}`);
+    process.exit(1);
+  }
+}
+if (args.venues && !cryptoMode) console.error('[warn] --venues only applies with --crypto; ignoring');
+
 const cfg = {
   url: args.url || 'wss://demo.dxfeed.com/market-data/dxlink-ws',
   token: args.token || process.env.DXFEED_TOKEN || '',
@@ -54,34 +78,126 @@ const cfg = {
   domSources: (args['dom-sources'] || '').split(',').filter(Boolean),
   domDepth: Number(args['dom-depth'] || 20),
   crypto: cryptoMode,
+  venues,
   cryptoSymbols: (args['crypto-symbols'] || 'BTC-USD,ETH-USD').split(',').map(s => s.trim()).filter(Boolean),
+  metricsInterval: Number(args['metrics-interval'] || 1000),
+  sinkFile: args.sink || null,
+  sinkFormat: args['sink-format'] || null,
+  sseHeartbeatMs: Number(args['sse-heartbeat'] || 15000),
+  stalenessMs: Number(args['staleness-ms'] || 15000),
+  restTimeoutMs: Number(args['rest-timeout'] || 10000),
   authRequired,
   authOnly: !!args['auth-only'],
   noDxFeedToken: !!args['no-dxfeed-token'],
 };
 
-if (!cfg.http && !cfg.stdio && !cfg.authOnly) cfg.http = '127.0.0.1:8200';
+if (!cfg.http && !cfg.stdio && !cfg.authOnly && !cfg.sinkFile) cfg.http = '127.0.0.1:8200';
 
 // ---- engine ----
-const book = new BookEngine();
 const startedAt = new Date().toISOString();
 let authState = authRequired ? 'authenticating' : 'anonymous';
 let authInfo = null;
-let sseClients = new Set();
-let client = null; // DxLinkClient | CoinbaseL2Client
-
-book.on('delta', (d) => {
-  if (cfg.stdio) process.stdout.write(JSON.stringify(d) + '\n');
-  const payload = `data: ${JSON.stringify(d)}\n\n`;
-  for (const res of sseClients) {
-    if (res.filterSymbol && res.filterSymbol !== d.symbol) continue;
-    res.write(payload);
-  }
-});
+const sseClients = new Set();
+let client = null;                    // DxLinkClient
+const cryptoClients = new Map();      // venue -> adapter
+const venueStates = new Map();        // venue -> {state, lastFrameAt, detail}
+const books = new Map();              // venue -> {venue, book, metrics}
+let sink = cfg.sinkFile ? new Sink(cfg.sinkFile, cfg.sinkFormat) : null;
 
 function onLog(level, text) { console.error(`[${level}] ${text}`); }
 
+function broadcast(d) {
+  if (cfg.stdio) process.stdout.write(JSON.stringify(d) + '\n');
+  if (sink) sink.write(d);
+  const payload = `data: ${JSON.stringify(d)}\n\n`;
+  for (const c of sseClients) {
+    if (c.filterSymbol && c.filterSymbol !== d.symbol) continue;
+    if (c.venueFilter && c.venueFilter !== d.venue) continue;
+    if (c.kinds && !c.kinds.has(d.kind)) continue;
+    c.res.write(payload);
+  }
+}
+
+/** one book + metrics engine per venue, so books are never mixed */
+function ensureBook(venue) {
+  let entry = books.get(venue);
+  if (entry) return entry;
+  const book = new BookEngine();
+  const metrics = new MetricsEngine({ book, intervalMs: cfg.metricsInterval });
+  entry = { venue, book, metrics };
+  books.set(venue, entry);
+
+  book.on('delta', (d) => broadcast({ ...d, venue }));
+  book.on('gap', (g) => broadcast({ symbol: g.symbol, kind: 'gap', data: g.detail, ts: g.ts, venue }));
+  metrics.on('metrics', (m) => {
+    const evt = { symbol: m.symbol, kind: 'metrics', data: m, ts: Date.now(), venue };
+    if (cfg.stdio) process.stdout.write(JSON.stringify(evt) + '\n');
+    if (sink) sink.write(evt);
+    const payload = `data: ${JSON.stringify(evt)}\n\n`;
+    for (const c of sseClients) {
+      if (!c.metrics) continue;
+      if (c.filterSymbol && c.filterSymbol !== evt.symbol) continue;
+      if (c.venueFilter && c.venueFilter !== evt.venue) continue;
+      if (c.kinds && !c.kinds.has('metrics')) continue;
+      c.res.write(payload);
+    }
+  });
+  metrics.start();
+  return entry;
+}
+
+function wireVenueClient(venue, client) {
+  const { book } = ensureBook(venue);
+  venueStates.set(venue, { state: 'starting', lastFrameAt: 0, detail: null });
+  const touch = () => {
+    const st = venueStates.get(venue);
+    if (st) st.lastFrameAt = Date.now();
+  };
+  client.on('log', onLog);
+  client.on('state', (s, detail) => {
+    const st = venueStates.get(venue) || {};
+    st.state = s;
+    st.detail = detail;
+    st.lastFrameAt = Date.now();
+    venueStates.set(venue, st);
+  });
+  client.on('snapshot', (symbol, bids, asks, meta) => {
+    book.applyLevels({
+      symbol, bids, asks, source: venue,
+      seq: meta && meta.seq != null ? meta.seq : null,
+      time: meta && meta.ts ? meta.ts : Date.now(),
+    });
+    touch();
+  });
+  client.on('update', (symbol, side, price, size, meta) => {
+    book.applyLevel(symbol, side, price, size, venue, meta);
+    touch();
+  });
+  client.on('trade', (symbol, side, price, size, ts, meta) => {
+    book.applyTrade({
+      eventSymbol: symbol, price, size, time: ts,
+      side, venue, seq: meta && meta.seq != null ? meta.seq : null,
+    });
+    touch();
+  });
+  client.on('ticker', (symbol, t) => {
+    book.applyQuote({
+      eventSymbol: symbol,
+      bidPrice: t.bidPrice, bidSize: t.bidSize,
+      askPrice: t.askPrice, askSize: t.askSize,
+      eventTime: t.time,
+    });
+  });
+  client.on('gap', (symbol, detail) => {
+    book.emit('gap', { symbol, venue, detail, ts: Date.now() });
+  });
+  client.on('stale', (info) => {
+    onLog('warn', `${venue}: stale (${Math.round((info.idleMs || 0) / 1000)}s); forcing reconnect`);
+  });
+}
+
 function wireDxLink() {
+  const { book } = ensureBook(DXFEED_BOOK);
   client = new DxLinkClient({ url: cfg.url, token: cfg.token });
   client.on('log', onLog);
   client.on('authState', (s) => { authState = s; });
@@ -126,30 +242,99 @@ function wireDxLink() {
   client.start();
 }
 
-function wireCoinbase() {
-  client = new CoinbaseL2Client({ productIds: cfg.cryptoSymbols });
-  client.on('log', onLog);
-  client.on('snapshot', (productId, bids, asks) => {
-    book.applyLevels({ symbol: productId, time: Date.now(), bids, asks, source: 'coinbase' });
-  });
-  client.on('update', (productId, side, price, size) => {
-    book.applyLevel(productId, side === 'buy' ? 'bid' : 'ask', price, size, 'coinbase');
-  });
-  client.start();
-  authState = authRequired ? 'authorized' : 'anonymous';
-}
-
 // ---- HTTP API ----
-function bookJson(req, res, symbol) {
-  const snap = book.snapshot(symbol);
-  if (!snap) return json(res, 404, { error: 'unknown symbol', tracked: book.list() });
-  json(res, 200, snap);
-}
-
 function json(res, code, obj) {
   const body = JSON.stringify(obj);
   res.writeHead(code, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) });
   res.end(body);
+}
+
+/** split "<venue>/<symbol>" or "<symbol>" */
+function splitPath(rest) {
+  const parts = rest.split('/').filter(Boolean);
+  if (parts.length >= 2) return { venue: decodeURIComponent(parts[0]), symbol: decodeURIComponent(parts.slice(1).join('/')) };
+  return { venue: null, symbol: decodeURIComponent(rest) };
+}
+
+function findBook(venue, symbol) {
+  if (venue) {
+    const entry = books.get(venue);
+    if (!entry) return null;
+    const snap = entry.book.snapshot(symbol);
+    return snap ? { venue, snap } : null;
+  }
+  for (const [v, entry] of books) {
+    const snap = entry.book.snapshot(symbol);
+    if (snap) return { venue: v, snap };
+  }
+  return null;
+}
+
+function allSymbols() {
+  const out = [];
+  for (const [venue, entry] of books) {
+    for (const s of entry.book.list()) out.push({ venue, ...s });
+  }
+  return out;
+}
+
+function bookJson(req, res, venue, symbol) {
+  const found = findBook(venue, symbol);
+  if (!found) return json(res, 404, { error: 'unknown symbol', tracked: allSymbols() });
+  json(res, 200, { venue: found.venue, ...found.snap });
+}
+
+function metricsJson(req, res, venue, symbol) {
+  if (venue) {
+    const entry = books.get(venue);
+    if (!entry) return json(res, 404, { error: 'unknown venue', venues: [...books.keys()] });
+    const m = entry.metrics.compute(symbol);
+    if (!m) return json(res, 404, { error: 'unknown symbol', tracked: allSymbols() });
+    return json(res, 200, { venue, ...m });
+  }
+  if (!symbol) {
+    const out = [];
+    for (const [v, entry] of books) {
+      for (const s of entry.book.symbols()) {
+        const m = entry.metrics.compute(s);
+        if (m) out.push({ venue: v, ...m });
+      }
+    }
+    return json(res, 200, out);
+  }
+  for (const [v, entry] of books) {
+    const m = entry.metrics.compute(symbol);
+    if (m) return json(res, 200, { venue: v, ...m });
+  }
+  return json(res, 404, { error: 'unknown symbol', tracked: allSymbols() });
+}
+
+function healthJson(res) {
+  const venueHealth = {};
+  for (const [name, st] of venueStates) {
+    venueHealth[name] = {
+      state: st.state,
+      lastFrameAt: st.lastFrameAt,
+      staleMs: st.lastFrameAt ? Date.now() - st.lastFrameAt : null,
+      detail: st.detail || null,
+    };
+  }
+  json(res, 200, {
+    status: 'ok', startedAt,
+    url: cfg.crypto ? null : cfg.url, authState,
+    auth: authInfo ? {
+      licenseKey: authInfo.licenseKey,
+      activation: authInfo.activation.result,
+      dxfeed: authInfo.dxfeed ? { filters: authInfo.dxfeed.filters, code: authInfo.dxfeed.code, hasToken: !!authInfo.dxfeed.token } : null,
+      crypto: authInfo.crypto ? { adapters: authInfo.crypto.adapters, maxInstruments: authInfo.crypto.maxInstruments } : null,
+    } : null,
+    mode: cfg.crypto ? 'crypto' : 'dxfeed',
+    venues: cfg.crypto ? venueHealth : null,
+    connected: cfg.crypto ? (cryptoClients.size ? 'multi' : 'idle') : (client ? client.state : 'idle'),
+    serverProtocol: client && client.serverSetup && client.serverSetup.version,
+    metricsIntervalMs: cfg.metricsInterval,
+    tracked: allSymbols(),
+  });
 }
 
 if (cfg.http) {
@@ -157,40 +342,57 @@ if (cfg.http) {
   const server = http.createServer((req, res) => {
     const u = new URL(req.url, 'http://localhost');
     const p = u.pathname;
-    if (p === '/health') {
-      return json(res, 200, {
-        status: 'ok', startedAt,
-        url: cfg.crypto ? null : cfg.url, authState,
-        auth: authInfo ? {
-          licenseKey: authInfo.licenseKey,
-          activation: authInfo.activation.result,
-          dxfeed: authInfo.dxfeed ? { filters: authInfo.dxfeed.filters, code: authInfo.dxfeed.code, hasToken: !!authInfo.dxfeed.token } : null,
-          crypto: authInfo.crypto ? { adapters: authInfo.crypto.adapters, maxInstruments: authInfo.crypto.maxInstruments } : null,
-        } : null,
-        connected: client ? client.state : 'idle',
-        serverProtocol: client && client.serverSetup && client.serverSetup.version,
-        mode: cfg.crypto ? 'crypto' : 'dxfeed',
-        tracked: book.list(),
-      });
+    if (p === '/health') return healthJson(res);
+    if (p === '/symbols') return json(res, 200, allSymbols());
+    if (p === '/metrics') return metricsJson(req, res, null, null);
+    if (p.startsWith('/metrics/')) {
+      const { venue, symbol } = splitPath(p.slice(9));
+      return metricsJson(req, res, venue, symbol);
     }
-    if (p === '/symbols') return json(res, 200, book.list());
-    if (p.startsWith('/book/')) return bookJson(req, res, decodeURIComponent(p.slice(6)));
+    if (p.startsWith('/book/')) {
+      const { venue, symbol } = splitPath(p.slice(6));
+      return bookJson(req, res, venue, symbol);
+    }
     if (p.startsWith('/top/')) {
-      const snap = book.snapshot(decodeURIComponent(p.slice(5)));
-      if (!snap) return json(res, 404, { error: 'unknown symbol' });
-      return json(res, 200, { symbol: snap.symbol, depthSource: snap.depthSource, top: snap.top, quote: snap.quote, trade: snap.trade });
+      const { venue, symbol } = splitPath(p.slice(5));
+      const found = findBook(venue, symbol);
+      if (!found) return json(res, 404, { error: 'unknown symbol' });
+      const snap = found.snap;
+      return json(res, 200, {
+        venue: found.venue, symbol: snap.symbol, depthSource: snap.depthSource,
+        lastSeq: snap.lastSeq, top: snap.top, quote: snap.quote, trade: snap.trade,
+      });
     }
     if (p === '/stream') {
       res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
       res.write(': connected\n\n');
-      res.filterSymbol = u.searchParams.get('symbol');
-      sseClients.add(res);
+      const kinds = u.searchParams.get('kinds');
+      const kindSet = kinds ? new Set(kinds.split(',').map(s => s.trim()).filter(Boolean)) : null;
+      sseClients.add({
+        res,
+        filterSymbol: u.searchParams.get('symbol'),
+        venueFilter: u.searchParams.get('venue'),
+        kinds: kindSet,
+        metrics: u.searchParams.get('metrics') === '1' || (kindSet && kindSet.has('metrics')),
+      });
       req.on('close', () => sseClients.delete(res));
       return;
     }
-    json(res, 404, { error: 'not found', endpoints: ['/health', '/symbols', '/book/<symbol>', '/top/<symbol>', '/stream'] });
+    json(res, 404, {
+      error: 'not found',
+      endpoints: [
+        '/health', '/symbols', '/book/<symbol>', '/book/<venue>/<symbol>', '/top/<symbol>',
+        '/metrics', '/metrics/<symbol>', '/metrics/<venue>/<symbol>', '/stream',
+      ],
+    });
   });
   server.listen(Number(port), host, () => console.error(`[http] listening on http://${host}:${port}`));
+}
+
+if (cfg.sseHeartbeatMs > 0) {
+  setInterval(() => {
+    for (const c of sseClients) c.res.write(': ping\n\n');
+  }, cfg.sseHeartbeatMs).unref();
 }
 
 // ---- start ----
@@ -211,9 +413,9 @@ async function start() {
       if (!cfg.crypto && res.dxfeed && res.dxfeed.code === 'OK' && res.dxfeed.token) cfg.token = res.dxfeed.token;
       if (cfg.crypto) {
         const adapters = res.crypto.adapters;
-        const needed = new Set(cfg.cryptoSymbols.map(s => CRYPTO_ADAPTERS[s] || 'CoinbasePro'));
-        if (adapters.length && ![...needed].every(a => adapters.includes(a))) {
-          throw new Error(`license does not entitle the crypto adapter(s): ${[...needed].filter(a => !adapters.includes(a)).join(',')}`);
+        const needed = [...new Set(cfg.venues.map(v => VENUE_ADAPTERS[v]).filter(Boolean))];
+        if (adapters.length && needed.length && !needed.every(a => adapters.includes(a))) {
+          throw new Error(`license does not entitle the crypto adapter(s): ${needed.filter(a => !adapters.includes(a)).join(',')}`);
         }
         if (cfg.cryptoSymbols.length > res.crypto.maxInstruments) {
           throw new Error(`license allows ${res.crypto.maxInstruments} crypto instrument(s), ${cfg.cryptoSymbols.length} requested`);
@@ -233,12 +435,27 @@ async function start() {
     process.exit(0);
   }
 
-  if (cfg.crypto) wireCoinbase();
-  else wireDxLink();
+  try {
+    resolveWebSocket();
+  } catch (e) {
+    console.error(`[fatal] ${e.message}`);
+    process.exit(1);
+  }
 
   if (cfg.crypto) {
-    console.error(`[bookmap-l2-client] mode=crypto venue=coinbase symbols=${cfg.cryptoSymbols.join(',')} license=${authInfo ? authInfo.licenseKey : 'none'}`);
+    for (const venue of cfg.venues) {
+      const venueClient = createVenue(venue, {
+        symbols: cfg.cryptoSymbols,
+        stalenessMs: cfg.stalenessMs,
+        restTimeoutMs: cfg.restTimeoutMs,
+      });
+      cryptoClients.set(venue, venueClient);
+      wireVenueClient(venue, venueClient);
+      venueClient.start();
+    }
+    console.error(`[bookmap-l2-client] mode=crypto venues=${cfg.venues.join(',')} symbols=${cfg.cryptoSymbols.join(',')} license=${authInfo ? authInfo.licenseKey : 'none'}`);
   } else {
+    wireDxLink();
     console.error(`[bookmap-l2-client] mode=dxfeed url=${cfg.url} symbols=${cfg.symbols.join(',')} events=${cfg.events.join(',')} token=${cfg.token ? 'yes' : 'no'}`);
   }
 }
@@ -249,6 +466,9 @@ start().catch((e) => { console.error(`[fatal] ${e.stack || e.message}`); process
 function shutdown() {
   console.error('stopping');
   try { if (client) client.stop(); } catch { /* ignore */ }
+  for (const c of cryptoClients.values()) { try { c.stop(); } catch { /* ignore */ } }
+  for (const entry of books.values()) { try { entry.metrics.stop(); } catch { /* ignore */ } }
+  try { if (sink) sink.close(); } catch { /* ignore */ }
   if (authSession) authSession.logout().catch(() => {});
   setTimeout(() => process.exit(0), 250);
 }
