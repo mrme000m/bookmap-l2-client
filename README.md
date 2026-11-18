@@ -231,6 +231,15 @@ buy vs sell volume over a 60 s window, trade count and book `updatesPerSec`. Met
 available at `GET /metrics` and `GET /metrics/<symbol>` (or `/metrics/<venue>/<symbol>`),
 and can be streamed over SSE with `GET /stream?metrics=1` or appended to the `--sink` file.
 
+Each metrics payload also carries a `signals` object built by `lib/indicators.js` from
+the same tape: cumulative `cvd`, `obv`, anchored `vwap`, `strength`, OHLC `bar` with
+buy/sell `footprint`, closed-bar count, `ta` (`rsi`, `macd`, `adx`, `williamsR`) and a
+volume-at-price `profile` (`poc`, `valueArea`, `priceLevels`). Closed bars and large
+trades are emitted as SSE `kind=bar` / `kind=alert` events. `GET /bbo` aggregates the
+best bid/offer across venues without mixing their books. `GET /mpulse` exposes the
+optional headless Market Pulse widget client (`--mpulse`), which needs no Bookmap
+account or activation seat.
+
 ## HTTP API
 
 | Endpoint | Description |
@@ -240,14 +249,16 @@ and can be streamed over SSE with `GET /stream?metrics=1` or appended to the `--
 | `GET /venues` | per-venue native + canonical symbol sets and connection state |
 | `GET /data` | per-symbol data availability (`kinds`, `trades`, `updatesPerSec`, `lastSeq`) |
 | `GET /entitlements` | license entitlement map (`{active, kind, expires, limit, value}` per key) |
-| `GET /features` | which product features the licence entitles, plus data venues |
+| `GET /features` | entitlement resolution plus implementation `status`/`note` per feature and a `summary` |
+| `GET /bbo` | cross-venue best bid/offer, spread and mid per symbol |
+| `GET /mpulse` | Market Pulse client state and last estimate (requires `--mpulse`) |
 | `GET /book/<symbol>` | full L2 snapshot: `bids[]` (desc), `asks[]` (asc), `top`, `quote`, `trade`, `lastSeq` |
 | `GET /book/<venue>/<symbol>` | full L2 snapshot of one venue |
 | `GET /top/<symbol>` | L1 top of book |
 | `GET /metrics` | computed metrics for all tracked symbols |
 | `GET /metrics/<symbol>` | computed metrics for one symbol |
 | `GET /metrics/<venue>/<symbol>` | computed metrics for one venue/symbol |
-| `GET /stream` | SSE deltas: `?symbol=` `?venue=` `?kinds=depth,trade,quote,snapshot` `?metrics=1` |
+| `GET /stream` | SSE deltas: `?symbol=` `?venue=` `?kinds=depth,trade,quote,snapshot,bar,alert,mpulse` `?metrics=1` |
 | `POST /subscribe` | add symbols at runtime: `{"venue","symbols":[…]}` |
 | `POST /unsubscribe` | remove symbols at runtime: `{"venue","symbols":[…]}` |
 
@@ -301,6 +312,10 @@ es.onmessage = (m) => {
 --http host:port         enable HTTP API (default 127.0.0.1:8200)
 --stdio                  print NDJSON deltas to stdout
 --metrics-interval ms    metrics emit interval (default 1000)
+--bar-ms ms              OHLC/footprint bar width (default 60000)
+--large-trade-size n     emit an alert when a trade size >= n (default 0 = off)
+--mpulse                 enable the anonymous Market Pulse widget client (crypto mode)
+--mpulse-algos a,b       Market Pulse algos (default priceChange,volumePressureImbalance/TP)
 --sink <path>            append deltas/metrics to a file (.csv or .jsonl by extension)
 --sink-format jsonl|csv  override the sink format
 --sse-heartbeat ms       SSE comment heartbeat (default 15000, 0 disables)

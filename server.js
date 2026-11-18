@@ -28,6 +28,9 @@ const { MetricsEngine } = require('./lib/metrics');
 const { Sink } = require('./lib/sink');
 const { createVenue, VENUES } = require('./lib/venues');
 const { resolveWebSocket } = require('./lib/ws');
+const { featureSummary } = require('./lib/features');
+const { aggregate: aggregateBbo } = require('./lib/bbo');
+const { MPulseClient, toMpulseSymbol } = require('./lib/mpulse');
 
 // crypto venue -> Bookmap adapter name used for the entitlement check
 const VENUE_ADAPTERS = {
@@ -91,6 +94,10 @@ const cfg = {
   noDxFeedToken: !!args['no-dxfeed-token'],
   kickSeat: !!args['kick-seat'],
   bindSeat: !!args['bind-seat'],
+  barMs: Number(args['bar-ms'] || 60000),
+  largeTradeSize: Number(args['large-trade-size'] || 0),
+  mpulse: !!args.mpulse,
+  mpulseAlgos: (args['mpulse-algos'] || 'priceChange,volumePressureImbalance/TP').split(',').map(s => s.trim()).filter(Boolean),
 };
 
 if (!cfg.http && !cfg.stdio && !cfg.authOnly && !cfg.sinkFile) cfg.http = '127.0.0.1:8200';
@@ -104,6 +111,7 @@ let client = null;                    // DxLinkClient
 const cryptoClients = new Map();      // venue -> adapter
 const venueStates = new Map();        // venue -> {state, lastFrameAt, detail}
 const books = new Map();              // venue -> {venue, book, metrics}
+const mpulseClients = new Map();      // symbol -> MPulseClient
 let sink = cfg.sinkFile ? new Sink(cfg.sinkFile, cfg.sinkFormat) : null;
 
 function onLog(level, text) { console.error(`[${level}] ${text}`); }
@@ -125,7 +133,10 @@ function ensureBook(venue) {
   let entry = books.get(venue);
   if (entry) return entry;
   const book = new BookEngine();
-  const metrics = new MetricsEngine({ book, intervalMs: cfg.metricsInterval });
+  const metrics = new MetricsEngine({
+    book, intervalMs: cfg.metricsInterval,
+    barMs: cfg.barMs, largeTradeSize: cfg.largeTradeSize,
+  });
   entry = { venue, book, metrics };
   books.set(venue, entry);
 
@@ -144,6 +155,8 @@ function ensureBook(venue) {
       c.res.write(payload);
     }
   });
+  metrics.on('bar', (b) => broadcast({ ...b, kind: 'bar', venue }));
+  metrics.on('alert', (a) => broadcast({ ...a, kind: 'alert', venue }));
   metrics.start();
   return entry;
 }
@@ -334,7 +347,10 @@ function changeSubscription(venue, canonicalSymbols, remove) {
     } else {
       delete client.symbolMap[nat];
       for (const alias of def.aliases(sym)) delete client.symbolMap[alias];
-      if (entry) entry.book.removeSymbol(sym);
+      if (entry) {
+        entry.book.removeSymbol(sym);
+        entry.metrics.removeSymbol(sym);
+      }
     }
   }
   return { ok: true, venue, action: remove ? 'unsubscribe' : 'subscribe', added: changed.length, symbols: canonical };
@@ -393,6 +409,7 @@ function healthJson(res) {
     mode: cfg.crypto ? 'crypto' : 'dxfeed',
     venues: cfg.crypto ? venueHealth : null,
     connected: cfg.crypto ? (cryptoClients.size ? 'multi' : 'idle') : (client ? client.state : 'idle'),
+    mpulse: mpulseClients.size ? Object.fromEntries([...mpulseClients].map(([s, c]) => [s, c.state || 'connecting'])) : null,
     serverProtocol: client && client.serverSetup && client.serverSetup.version,
     metricsIntervalMs: cfg.metricsInterval,
     tracked: allSymbols(),
@@ -427,6 +444,7 @@ if (cfg.http) {
         entitled: features.filter((f) => f.entitled).map((f) => ({ id: f.id, name: f.name })),
         notEntitled: features.filter((f) => !f.entitled).map((f) => ({ id: f.id, name: f.name })),
         features,
+        summary: featureSummary(features),
         dataVenues: authInfo.dataVenues || [],
         maxInstruments: authInfo.maxInstruments,
         crypto: authInfo.crypto,
@@ -485,6 +503,13 @@ if (cfg.http) {
       const { venue, symbol } = splitPath(p.slice(9));
       return metricsJson(req, res, venue, symbol);
     }
+    if (p === '/bbo') return json(res, 200, aggregateBbo(books));
+    if (p === '/mpulse') {
+      return json(res, 200, [...mpulseClients.entries()].map(([symbol, c]) => ({
+        symbol, state: c.state || 'connecting', endpoints: c.endpointCount || 0,
+        lastEstimate: c.lastEstimate || null,
+      })));
+    }
     if (p.startsWith('/book/')) {
       const { venue, symbol } = splitPath(p.slice(6));
       return bookJson(req, res, venue, symbol);
@@ -519,7 +544,7 @@ if (cfg.http) {
       endpoints: [
         '/health', '/symbols', '/venues', '/data', '/entitlements', '/features',
         '/book/<symbol>', '/book/<venue>/<symbol>', '/top/<symbol>',
-        '/metrics', '/metrics/<symbol>', '/metrics/<venue>/<symbol>', '/stream',
+        '/metrics', '/metrics/<symbol>', '/metrics/<venue>/<symbol>', '/bbo', '/mpulse', '/stream',
         'POST /subscribe', 'POST /unsubscribe',
       ],
     });
@@ -595,6 +620,23 @@ async function start() {
       wireVenueClient(venue, venueClient);
       venueClient.start();
     }
+    if (cfg.mpulse) {
+      for (const symbol of cfg.cryptoSymbols) {
+        const mpSymbol = toMpulseSymbol(symbol);
+        if (!mpSymbol) continue;
+        const c = new MPulseClient({ symbol: mpSymbol, algos: cfg.mpulseAlgos });
+        mpulseClients.set(symbol, c);
+        c.on('estimate', (e) => {
+          c.lastEstimate = e;
+          broadcast({ symbol, kind: 'mpulse', venue: 'mpulse', data: e, ts: Date.now() });
+        });
+        c.on('state', (s) => { c.state = s; });
+        c.on('log', (msg) => onLog('mpulse', msg));
+        c.connect()
+          .then((n) => { c.endpointCount = n; c.state = 'connected'; })
+          .catch((e) => { c.state = 'failed'; onLog('mpulse', e.message); });
+      }
+    }
     console.error(`[bookmap-l2-client] mode=crypto venues=${cfg.venues.join(',')} symbols=${cfg.cryptoSymbols.join(',')} license=${authInfo ? authInfo.licenseKey : 'none'}`);
   } else {
     wireDxLink();
@@ -609,6 +651,7 @@ function shutdown() {
   console.error('stopping');
   try { if (client) client.stop(); } catch { /* ignore */ }
   for (const c of cryptoClients.values()) { try { c.stop(); } catch { /* ignore */ } }
+  for (const c of mpulseClients.values()) { try { c.stop(); } catch { /* ignore */ } }
   for (const entry of books.values()) { try { entry.metrics.stop(); } catch { /* ignore */ } }
   try { if (sink) sink.close(); } catch { /* ignore */ }
   if (authSession) authSession.logout().catch(() => {});

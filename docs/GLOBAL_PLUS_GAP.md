@@ -10,6 +10,15 @@ It is based on three sources, kept deliberately separate:
 
 Static inspection does not prove runtime behavior. Where the client does not implement a feature, that is an observed absence in this code, not a claim that Bookmap cannot do it.
 
+> **Update 2026-11-18 — Path A gaps closed.** The cheap DERIVED gaps from §8 have been
+> implemented in this repository: `lib/indicators.js` adds OHLC/footprint bars, CVD,
+> OBV, anchored VWAP, strength, volume-at-price/POC/value area and RSI/MACD/ADX/Williams
+> %R over closed bars; `lib/bbo.js` + `GET /bbo` provide cross-venue BBO; `lib/mpulse.js`
+> + `--mpulse` provide the anonymous Market Pulse client (Price Change / Volume Pressure
+> Imbalance). All are fed by the existing venue tape. `GET /features` now reports an
+> implementation `status` and `note` per feature plus a `summary`. See §10 for the
+> revised status and the remaining blockers (MBO/L1 bridge, UI, execution, replay).
+
 ---
 
 ## 1. Executive summary
@@ -255,8 +264,8 @@ Prefer Path A + Path B over reimplementing Path C.
 
 ## 8. Recommended roadmap
 
-1. **Close the cheap DERIVED gaps first** — bar builder, cumulative delta, anchored VWAP, POC, multi-venue BBO. These use data already flowing and add no seat risk.
-2. **Add a Market Pulse client** using the anonymous API fv00 already reverse-engineered — closes three entitled features without a licence session.
+1. ~~**Close the cheap DERIVED gaps first**~~ — **DONE**: `lib/indicators.js`, `lib/bbo.js`, `GET /bbo`. No seat risk.
+2. ~~**Add a Market Pulse client**~~ — **DONE**: `lib/mpulse.js`, `--mpulse`, `GET /mpulse`. No licence session.
 3. **Prototype the L1 websocket bridge** with a minimal Python add-on for MBO events — this is the only route to the entitled TraderMap Pro on crypto.
 4. **Do not pursue** BookmapData/CME/Nasdaq/EDGX until those source entitlements are renewed; the current probe shows them expired.
 5. **Never enable `--kick-seat`** in an automated deployment; the seat is shared with the user's own Bookmap app.
@@ -270,3 +279,27 @@ Prefer Path A + Path B over reimplementing Path C.
 - API surface from the official knowledge-base pages (last updated Oct 2026 / Aug 2026) and the shipped L1 API 8.0.0 javadoc.
 - **REA was unavailable** on this host (no registered tools/CLI; all `rea-agents` releases require Node ≥22, host has Node 20.18.0). No REA Evidence was produced. The jar/javadoc findings above come from ordinary shell inspection (`System.IO.Compression.ZipFile`) and are labelled as such.
 - fv00 statements are cited from its checked-out source at `C:\Windows\TEMP\opencode\fv00` (clone of `mrme000m/fv00`); they are that project's findings, not independent verification here.
+
+---
+
+## 10. Revised status after Path A (2026-11-18)
+
+Now implemented from the existing venue tape (no extra licence, no seat): CVD, large-trade
+alerts, footprint, market profile / POC / value area, RSI / MACD / ADX / Williams %R, OBV,
+anchored VWAP, strength, cross-venue BBO, and Market Pulse Price Change / Volume Pressure
+Imbalance (opt-in with `--mpulse`).
+
+Still open, unchanged by Path A:
+
+- **MBO features** (TraderMap Pro, stops/icebergs, sweeps, MBO X-Ray, liquidity tracker):
+  public crypto L2 has no order IDs. Only a Java/Python L1 bridge inside Bookmap can
+  supply `MboEvent` / `MboSendEvent` / `MboCancelEvent` (§7 Path B).
+- **UI/execution features** (DOM Pro, columns, bottom panel, sync charts, brackets,
+  execution statistics, trading journal, break-even, setups): out of scope for a
+  headless data service.
+- **Record & Replay** and app-level recording: `--sink` remains a partial substitute.
+- **Rithmic, BookmapData, CME/Nasdaq/EDGX**: no adapter or expired source entitlements;
+  do not pursue until the source filters are renewed.
+
+`/features` is now the authoritative in-code status: each feature carries
+`status` (`yes` / `derived` / `partial` / `no` / `not-entitled`) and a short `note`.
