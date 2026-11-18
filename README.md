@@ -216,7 +216,12 @@ MBO / order-level data (stops, icebergs, trader maps), DOM / footprint tick-by-t
 options gamma levels, historical replay and recording.
 
 License gating for the desktop features is visible through the activation server and is
-exposed by this client at `GET /entitlements`.
+exposed by this client at `GET /entitlements` and resolved to product features at
+`GET /features`.
+
+For a full feature-by-feature breakdown — what is implemented, what is derivable, what is
+missing, and the documented extension paths (L1 Python/Java bridge, L0 API) — see
+[Global Plus Feature Coverage & Gap Analysis](docs/GLOBAL_PLUS_GAP.md).
 
 ## Realtime metrics
 
