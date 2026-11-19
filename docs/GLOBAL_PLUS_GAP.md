@@ -265,7 +265,7 @@ Prefer Path A + Path B over reimplementing Path C.
 ## 8. Recommended roadmap
 
 1. ~~**Close the cheap DERIVED gaps first**~~ — **DONE**: `lib/indicators.js`, `lib/bbo.js`, `GET /bbo`. No seat risk.
-2. ~~**Add a Market Pulse client**~~ — **DONE**: `lib/mpulse.js`, `--mpulse`, `GET /mpulse`. No licence session.
+2. ~~**Add a Market Pulse client**~~ — **DONE**: `lib/mpulse.js`, `--mpulse`, `GET /mpulse`. No licence session. Refused upstream handshakes were traced to invalid default presets for the orderbook widgets and to reporting sockets connected before `AUTH_SUCCESS`; both are fixed, and retries mint a fresh token.
 3. **Prototype the L1 websocket bridge** with a minimal Python add-on for MBO events — this is the only route to the entitled TraderMap Pro on crypto.
 4. **Do not pursue** BookmapData/CME/Nasdaq/EDGX until those source entitlements are renewed; the current probe shows them expired.
 5. **Never enable `--kick-seat`** in an automated deployment; the seat is shared with the user's own Bookmap app.

@@ -1,7 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { mintAuthToken, widgetRequest, parseFrame, toMpulseSymbol } = require('../lib/mpulse');
+const { mintAuthToken, widgetRequest, parseFrame, toMpulseSymbol, ALGOS } = require('../lib/mpulse');
 const { aggregate: aggregateBbo } = require('../lib/bbo');
 const { BookEngine } = require('../lib/book');
 
@@ -21,7 +21,19 @@ test('mpulse: anonymous token, widget request and frame parsing', () => {
   assert.equal(e.type, 'estimate');
   assert.equal(e.estimate, 0.5);
   assert.equal(parseFrame('{"type":"AUTH_SUCCESS"}').type, 'AUTH_SUCCESS');
+  assert.deepEqual(
+    parseFrame('{"type":"ERROR","error":"Requested endpoint does not exist"}'),
+    { type: 'ERROR', error: 'Requested endpoint does not exist' }
+  );
   assert.equal(toMpulseSymbol('BTC-USD'), 'BTC-USDT');
+});
+
+test('mpulse: orderbook widgets use their provisioned presets', () => {
+  assert.equal(widgetRequest('priceChange', 'BTC-USDT').presetId, 'Medium');
+  assert.equal(widgetRequest('orderbookPressure', 'BTC-USDT').presetId, ALGOS.orderbookPressure.preset);
+  assert.equal(widgetRequest('orderbookPressureImbalance', 'BTC-USDT').presetId, 'Close range');
+  assert.equal(widgetRequest('liquidationPressure', 'BTC-USDT').instrumentType, 'PERP');
+  assert.equal(widgetRequest('orderbookPressure', 'BTC-USDT', { presetId: 'Medium' }).presetId, 'Medium');
 });
 
 test('bbo: picks best bid/ask across venue books without mixing them', () => {

@@ -242,7 +242,10 @@ volume-at-price `profile` (`poc`, `valueArea`, `priceLevels`). Closed bars and l
 trades are emitted as SSE `kind=bar` / `kind=alert` events. `GET /bbo` aggregates the
 best bid/offer across venues without mixing their books. `GET /mpulse` exposes the
 optional headless Market Pulse widget client (`--mpulse`), which needs no Bookmap
-account or activation seat.
+account or activation seat. Each widget's preset is chosen from its server-side
+provisioning (the orderbook widgets use `Close range`, not `Medium`); a socket is
+reported connected only after its `AUTH_SUCCESS` frame. Refused handshakes are
+retried with a freshly minted anonymous token and endpoint.
 
 ## HTTP API
 

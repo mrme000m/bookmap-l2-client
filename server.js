@@ -713,6 +713,7 @@ if (cfg.http) {
     if (p === '/mpulse') {
       return json(res, 200, [...mpulseClients.entries()].map(([symbol, c]) => ({
         symbol, state: c.state || 'connecting', endpoints: c.endpointCount || 0,
+        ready: [...(c.readyAlgos || [])], lastError: c.lastError || null,
         lastEstimate: c.lastEstimate || null,
       })));
     }
@@ -880,11 +881,11 @@ async function start() {
           c.lastEstimate = e;
           broadcast({ symbol, kind: 'mpulse', venue: 'mpulse', data: e, ts: Date.now() });
         });
-        c.on('state', (s) => { c.state = s; });
+        c.on('state', (s, meta) => { c.state = s; c.stateMeta = meta || null; });
         c.on('log', (msg) => onLog('mpulse', msg));
         c.connect()
-          .then((n) => { c.endpointCount = n; c.state = 'connected'; })
-          .catch((e) => { c.state = 'failed'; onLog('mpulse', e.message); });
+          .then((n) => { c.endpointCount = n; })
+          .catch((e) => { c.state = 'failed'; c.lastError = e.message; onLog('mpulse', e.message); });
       }
     }
     console.error(`[bookmap-l2-client] mode=crypto venues=${cfg.venues.join(',')} symbols=${cfg.cryptoSymbols.join(',')} license=${authInfo ? authInfo.licenseKey : 'none'}`);
